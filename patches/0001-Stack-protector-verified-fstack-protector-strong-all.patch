@@ -1,0 +1,2713 @@
+From 12577b3ca807e8b0351a83ea7d84b3ca0b1ff06b Mon Sep 17 00:00:00 2001
+From: Justin Restivo <justin@restivo.me>
+Date: Mon, 16 Nov 2026 14:12:29 -0500
+Subject: [PATCH 1/3] Stack protector (verified):
+ -fstack-protector[-strong|-all]
+
+Port of the stack-canary pass of Chamois-CompCert (D. Monniaux,
+"Memory simulations, security and optimization in a verified
+compiler", CPP 2024) to AbsInt master.  backend/Canary.v and
+backend/Canaryproof.v come from Chamois (2023-09, before its
+memory-model changes), adapted to upstream:
+
+- RTL: no trapping mode on Iload, no branch-prediction field on Icond,
+  argument typing premise on internal calls.
+- Mem.loadv/storev now check that the access fits below the modulus;
+  canary_needed therefore requires canary_offset + canary_size <=
+  max_unsigned (Chamois only bounded the offset), and the proof shows
+  the canary load/store passes the check (canary_load_bound).
+
+The pass runs on RTL after dead code elimination.  For every function
+with stack-allocated variables (all functions with -all), it reserves
+an aligned slot after the variables, stores the canary there on entry,
+and before every return and tail call compares it with the canary and
+calls __stack_chk_fail on mismatch.  The proof is a forward simulation
+in which the check never fails for programs without undefined
+behaviour; it does not prove that canaries stop attacks.  The only new
+assumptions are the canary values (Values.canary32_val/canary64_val)
+and the two option flags.
+
+Targets: x86-64 and IA32 (canary at %fs:40 / %gs:20) and AArch64
+(__stack_chk_guard), Linux only.  ARM, PowerPC and RISC-V define
+getcanary := None, so the pass is the identity there.
+---
+ Makefile                 |    1 +
+ aarch64/Archi.v          |    3 +
+ aarch64/Asm.v            |    7 +-
+ aarch64/Asmexpand.ml     |    4 +
+ aarch64/Asmgen.v         |    2 +
+ aarch64/NeedOp.v         |    1 +
+ aarch64/Op.v             |   15 +-
+ aarch64/PrintOp.ml       |    1 +
+ aarch64/TargetPrinter.ml |    9 +
+ aarch64/ValueAOp.v       |    2 +
+ arm/Archi.v              |    3 +
+ arm/Op.v                 |    5 +
+ backend/Canary.v         |  112 +++
+ backend/Canaryproof.v    | 1777 ++++++++++++++++++++++++++++++++++++++
+ backend/ValueDomain.v    |   10 +
+ common/Values.v          |   22 +
+ driver/Clflags.ml        |    3 +
+ driver/Compiler.v        |   12 +-
+ driver/Compopts.v        |    7 +
+ driver/Driver.ml         |   23 +
+ extraction/extraction.v  |    8 +
+ powerpc/Archi.v          |    3 +
+ powerpc/Op.v             |    5 +
+ riscV/Archi.v            |    3 +
+ riscV/Op.v               |    5 +
+ x86/Asm.v                |    7 +-
+ x86/Asmexpand.ml         |    3 +
+ x86/Asmgen.v             |    2 +
+ x86/Machregs.v           |    1 +
+ x86/NeedOp.v             |    1 +
+ x86/Op.v                 |   14 +-
+ x86/PrintOp.ml           |    1 +
+ x86/TargetPrinter.ml     |    9 +
+ x86/ValueAOp.v           |    2 +
+ x86_32/Archi.v           |    3 +
+ x86_64/Archi.v           |    3 +
+ 36 files changed, 2083 insertions(+), 6 deletions(-)
+ create mode 100644 backend/Canary.v
+ create mode 100644 backend/Canaryproof.v
+
+diff --git a/Makefile b/Makefile
+index 53d73fe6..f30761f9 100644
+--- a/Makefile
++++ b/Makefile
+@@ -207,6 +207,7 @@ BACKEND=\
+   ConstpropOp.v Constprop.v ConstpropOpproof.v Constpropproof.v \
+   CSEdomain.v CombineOp.v CSE.v CombineOpproof.v CSEproof.v \
+   NeedDomain.v NeedOp.v Deadcode.v Deadcodeproof.v \
++  Canary.v Canaryproof.v \
+   Unusedglob.v Unusedglobproof.v \
+   Machregs.v Locations.v Conventions1.v Conventions.v LTL.v \
+   Allocation.v Allocproof.v \
+diff --git a/aarch64/Archi.v b/aarch64/Archi.v
+index e1176254..44bad8ed 100644
+--- a/aarch64/Archi.v
++++ b/aarch64/Archi.v
+@@ -28,6 +28,9 @@ Definition align_float64 := 8%Z.
+ 
+ Definition splitlong := false.
+ 
++(** Whether the stack-protector canary is a 64-bit value. *)
++Definition canary64 := true.
++
+ Lemma splitlong_ptr32: splitlong = true -> ptr64 = false.
+ Proof.
+   unfold splitlong, ptr64; congruence.
+diff --git a/aarch64/Asm.v b/aarch64/Asm.v
+index 5bf3456b..7a3898f1 100644
+--- a/aarch64/Asm.v
++++ b/aarch64/Asm.v
+@@ -306,6 +306,8 @@ Inductive instruction: Type :=
+   | Pnop                                                              (**r no operation *)
+   | Pcfi_adjust (ofs: int)                                            (**r .cfi_adjust debug directive *)
+   | Pcfi_rel_offset (ofs: int)                                        (**r .cfi_rel_offset debug directive *)
++  | Pgetcanary (rd: ireg)                                             (**r load the stack-protector canary *)
++  | Pstack_chk_fail                                                   (**r call [__stack_chk_fail] *)
+ .
+ 
+ Definition code := list instruction.
+@@ -1128,6 +1130,8 @@ Definition exec_instr (f: function) (i: instruction) (rs: regset) (m: mem) : out
+   | Pcfi_rel_offset _ =>
+       Next (nextinstr rs) m
+   | Pbuiltin ef args res => Stuck    (**r treated specially below *)
++  | Pgetcanary rd =>
++      Next (nextinstr (rs#rd <- (canary_val tt))) m
+   (** The following instructions and directives are not generated directly
+       by Asmgen, so we do not model them. *)
+   | Pldp _ _ _
+@@ -1145,7 +1149,8 @@ Definition exec_instr (f: function) (i: instruction) (rs: regset) (m: mem) : out
+   | Pfmax _ _ _ _
+   | Pfmin _ _ _ _
+   | Pnop
+-  | Pcfi_adjust _ =>
++  | Pcfi_adjust _
++  | Pstack_chk_fail =>
+       Stuck
+   end.
+ 
+diff --git a/aarch64/Asmexpand.ml b/aarch64/Asmexpand.ml
+index 4d1f5808..b4ecb361 100644
+--- a/aarch64/Asmexpand.ml
++++ b/aarch64/Asmexpand.ml
+@@ -363,6 +363,9 @@ let expand_builtin_inline name args res =
+   (* Optimization hint *)
+   | "__builtin_unreachable", [], _ ->
+      ()
++  (* Stack protector: canary mismatch *)
++  | "__stack_chk_fail", [], _ ->
++     emit Pstack_chk_fail
+   (* Byte swap *)
+   | ("__builtin_bswap" | "__builtin_bswap32"), [BA(IR a1)], BR(IR res) ->
+      emit (Prev(W, res, a1))
+@@ -435,6 +438,7 @@ module BInfo: BRANCH_INFORMATION = struct
+   let instr_size = function
+     | Pfmovimmd _ | Pfmovimms _ -> 8
+     | Ploadsymbol _ -> 12
++    | Pgetcanary _ -> 12                 (* adrp + ldr (GOT) + ldr *)
+     | Pbtbl(_, tbl) -> 12 + 4 * List.length tbl
+     | Plabel _ | Pcfi_adjust _ | Pcfi_rel_offset _ -> 0
+     | Pbuiltin(ef, _, _) -> builtin_size ef
+diff --git a/aarch64/Asmgen.v b/aarch64/Asmgen.v
+index 5cd76ee4..f77b4809 100644
+--- a/aarch64/Asmgen.v
++++ b/aarch64/Asmgen.v
+@@ -910,6 +910,8 @@ Definition transl_op
+       | _ =>
+           Error(msg "Asmgen.Osel")
+       end
++  | Ogetcanary, nil =>
++      do rd <- ireg_of res; OK (Pgetcanary rd :: k)
+   | _, _ =>
+       Error(msg "Asmgen.transl_op")
+   end.
+diff --git a/aarch64/NeedOp.v b/aarch64/NeedOp.v
+index a3369c0a..8903c64a 100644
+--- a/aarch64/NeedOp.v
++++ b/aarch64/NeedOp.v
+@@ -138,6 +138,7 @@ Definition needs_of_operation (op: operation) (nv: nval): list nval :=
+   | Olongofsingle | Olonguofsingle | Osingleoflong | Osingleoflongu => op1 (default nv)
+   | Ocmp c => needs_of_condition c
+   | Osel c ty => nv :: nv :: needs_of_condition c
++  | Ogetcanary => nil
+   end.
+ 
+ Definition operation_is_redundant (op: operation) (nv: nval): bool :=
+diff --git a/aarch64/Op.v b/aarch64/Op.v
+index 4963baf1..623b91de 100644
+--- a/aarch64/Op.v
++++ b/aarch64/Op.v
+@@ -222,7 +222,8 @@ Inductive operation : Type :=
+   | Osingleoflongu                                      (**r [rd = float32_of_unsigned_int(r1)] *)
+ (** Boolean tests *)
+   | Ocmp (cond: condition)                              (**r [rd = 1] if condition holds, [rd = 0] otherwise. *)
+-  | Osel (cond: condition) (ty: typ).                   (**r [rd = rs1] if condition holds, [rd = rs2] otherwise. *)
++  | Osel (cond: condition) (ty: typ)                    (**r [rd = rs1] if condition holds, [rd = rs2] otherwise. *)
++  | Ogetcanary.                                         (**r [rd = stack-protector canary] *)
+ 
+ (** Addressing modes.  [r1], [r2], etc, are the arguments to the addressing. *)
+ 
+@@ -500,6 +501,7 @@ Definition eval_operation
+ 
+   | Ocmp c, _ => Some (Val.of_optbool (eval_condition c vl m))
+   | Osel c ty, v1::v2::vl => Some(Val.select (eval_condition c vl m) v1 v2 ty)
++  | Ogetcanary, nil => Some (canary_val tt)
+   | _, _ => None
+   end.
+ 
+@@ -711,6 +713,7 @@ Definition type_of_operation (op: operation) : list typ * typ :=
+ 
+   | Ocmp c => (type_of_condition c, Tint)
+   | Osel c ty => (ty :: ty :: type_of_condition c, ty)
++  | Ogetcanary => (nil, canary_type)
+   end.
+ 
+ Definition type_of_addressing (addr: addressing) : list typ :=
+@@ -919,6 +922,8 @@ Proof with (try exact I; try reflexivity; auto using Val.Vptr_has_type).
+   (* cmp *)
+   - destruct (eval_condition cond vl m) as [[]|]...
+   - unfold Val.select. destruct (eval_condition cond vl m). apply Val.normalize_type. exact I.
++  (* getcanary *)
++  - apply canary_has_type.
+ Qed.
+ 
+ End SOUNDNESS.
+@@ -1555,6 +1560,8 @@ Proof.
+   - apply Val.select_inject; auto.  
+     destruct (eval_condition cond vl1 m1) eqn:?; auto.
+     right; symmetry; eapply eval_condition_inj; eauto.
++  (* getcanary *)
++  - apply canary_inject.
+ Qed.
+ 
+ Lemma eval_addressing_inj:
+@@ -1767,3 +1774,9 @@ Definition builtin_arg_ok
+   | (BA _ | BA_splitlong (BA _) (BA _)) => true
+   | _ => builtin_arg_ok_1 ba c
+   end.  
++
++(** Stack protector: how to read the canary, how to compare it, and how to
++  clear the register that held it. *)
++Definition getcanary : option operation := Some Ogetcanary.
++Definition clearcanary := if Archi.canary64 then Olongconst Int64.zero else Ointconst Int.zero.
++Definition canary_cmp := if Archi.canary64 then Ccomplu Ceq else Ccompu Ceq.
+diff --git a/aarch64/PrintOp.ml b/aarch64/PrintOp.ml
+index 2d45e446..51ca888e 100644
+--- a/aarch64/PrintOp.ml
++++ b/aarch64/PrintOp.ml
+@@ -230,6 +230,7 @@ let print_operation reg pp = function
+   | Osingleoflongu, [r1] -> fprintf pp "singleoflongu(%a)" reg r1
+ (* Boolean tests *)
+   | Ocmp c, args -> print_condition reg pp (c, args)
++  | Ogetcanary, [] -> fprintf pp "getcanary"
+   | Osel (c, ty), r1::r2::args ->
+       fprintf pp "%a ?%s %a : %a"
+          (print_condition reg) (c, args)
+diff --git a/aarch64/TargetPrinter.ml b/aarch64/TargetPrinter.ml
+index c0500bec..1f81703e 100644
+--- a/aarch64/TargetPrinter.ml
++++ b/aarch64/TargetPrinter.ml
+@@ -607,6 +607,15 @@ module Target(System: SYSTEM): TARGET =
+         cfi_adjust oc (camlint_of_coqint sz)
+     | Pcfi_rel_offset ofs ->
+         cfi_rel_offset oc "x30" (camlint_of_coqint ofs)
++    | Pgetcanary rd ->
++        (* glibc on AArch64 keeps the canary in the global __stack_chk_guard *)
++        if Configuration.system <> "linux" then
++          failwith "-fstack-protector is only supported on Linux";
++        fprintf oc "	adrp	%a, :got:__stack_chk_guard\n" xreg rd;
++        fprintf oc "	ldr	%a, [%a, #:got_lo12:__stack_chk_guard]\n" xreg rd xreg rd;
++        fprintf oc "	ldr	%a, [%a]\n" xreg rd xreg rd
++    | Pstack_chk_fail ->
++        fprintf oc "	bl	__stack_chk_fail\n"
+     | Pbuiltin(ef, args, res) ->
+         begin match ef with
+           | EF_annot(kind,txt, targs) ->
+diff --git a/aarch64/ValueAOp.v b/aarch64/ValueAOp.v
+index 44d0df5f..d88db118 100644
+--- a/aarch64/ValueAOp.v
++++ b/aarch64/ValueAOp.v
+@@ -210,6 +210,7 @@ Definition eval_static_operation (op: operation) (vl: list aval): aval :=
+ 
+   | Ocmp c, _ => of_optbool (eval_static_condition c vl)
+   | Osel c ty, v1::v2::vl => select (eval_static_condition c vl) v1 v2 ty
++  | Ogetcanary, nil => canary_aval
+ 
+   | _, _ => Vbot
+   end.
+@@ -313,6 +314,7 @@ Proof.
+   rewrite Ptrofs.add_zero_l; eauto with va.
+   apply of_optbool_sound. eapply eval_static_condition_sound; eauto.
+   apply select_sound; eauto using eval_static_condition_sound.
++  apply canary_aval_sound.
+ Qed.
+ 
+ End SOUNDNESS.
+diff --git a/arm/Archi.v b/arm/Archi.v
+index 687053f3..35087132 100644
+--- a/arm/Archi.v
++++ b/arm/Archi.v
+@@ -29,6 +29,9 @@ Definition align_float64 := 8%Z.
+ 
+ Definition splitlong := true.
+ 
++(** Whether the stack-protector canary is a 64-bit value. *)
++Definition canary64 := false.
++
+ Lemma splitlong_ptr32: splitlong = true -> ptr64 = false.
+ Proof.
+   unfold splitlong, ptr64; congruence.
+diff --git a/arm/Op.v b/arm/Op.v
+index 0777620a..34927df9 100644
+--- a/arm/Op.v
++++ b/arm/Op.v
+@@ -1160,3 +1160,8 @@ Definition builtin_arg_ok
+   | (BA _ | BA_splitlong (BA _) (BA _)) => true
+   | _ => builtin_arg_ok_1 ba c
+   end.  
++
++(** Stack protector: not implemented on this target. *)
++Definition getcanary : option operation := None.
++Definition clearcanary := Ointconst Int.zero.
++Definition canary_cmp := Ccompu Ceq.
+diff --git a/backend/Canary.v b/backend/Canary.v
+new file mode 100644
+index 00000000..0cc31549
+--- /dev/null
++++ b/backend/Canary.v
+@@ -0,0 +1,112 @@
++Require Import Coqlib Wfsimpl Maps Errors Integers Values.
++Require Import AST Linking Globalenvs.
++Require Import Op Registers RTL Memdata.
++Require Compopts.
++
++Definition canary_chunk :=
++  if Archi.canary64 then Mint64 else Mint32.
++
++Definition canary_size :=
++  if Archi.canary64 then 8 else 4.
++
++Definition padding ofs al :=
++  let md := Z.modulo ofs al in
++  if zeq md 0
++  then 0
++  else al - md.
++
++Definition canary_offset (f : function) :=
++  f.(fn_stacksize) + (padding f.(fn_stacksize) (align_chunk canary_chunk)).
++
++Definition canary_needed (f : function) : bool :=
++  match getcanary with
++  | Some _ =>
++      zle 0 f.(fn_stacksize) &&
++      zle (canary_size + canary_offset f) Ptrofs.max_unsigned &&
++      Compopts.stack_protector tt &&
++      (Compopts.stack_protector_all tt ||
++         zlt 0 f.(fn_stacksize))
++  | None => false
++  end.
++
++Definition extra_canary_size (f : function) :=
++  if canary_needed f
++  then (padding f.(fn_stacksize) (align_chunk canary_chunk)) + canary_size
++  else 0.
++
++Definition code_append (st : code * node) fop : code * node :=
++  let (co, pc) := st in
++  (PTree.set pc (fop pc) co, Pos.succ pc).
++
++Definition entry_sequence entrypoint offset tmpreg (code0 : code * node) : code * node :=
++  match getcanary with
++  | None => code0
++  | Some canary_op =>
++      let code1 := code_append code0
++                     (fun pc => Iop canary_op nil tmpreg (Pos.succ pc)) in
++      let code2 := code_append code1
++                               (fun pc => Istore canary_chunk (Ainstack (Ptrofs.repr offset)) nil tmpreg (Pos.succ pc)) in
++      code_append code2 (fun _ => Iop clearcanary nil tmpreg entrypoint)
++  end.
++
++Definition check_sequence crash_pc offset tmpreg insn (code0 : code * node) : code * node :=
++  match getcanary with
++  | None => code0
++  | Some canary_op =>
++      let tmpreg2 := Pos.succ tmpreg in
++      let code1 := code_append code0
++                               (fun pc => Iload canary_chunk (Ainstack (Ptrofs.repr offset)) nil tmpreg (Pos.succ pc)) in
++      let code2 := code_append code1
++                               (fun pc => Iop canary_op nil tmpreg2 (Pos.succ pc)) in
++      let code3 := code_append code2
++                               (fun pc => Icond (negate_condition canary_cmp) (tmpreg :: tmpreg2 :: nil) crash_pc (Pos.succ pc)) in
++      code_append code3 (fun _ => insn)
++  end.
++
++Definition check_insn insn :=
++  match insn with
++  | Ireturn _ | Itailcall _ _ _ => true
++  | _ => false
++  end.
++
++Definition apply_check (crash_pc : node) offset tmpreg (code0 : code*node) (at_pc : node) (insn : instruction) : code*node :=
++  if check_insn insn
++     then
++         let code' := check_sequence crash_pc offset tmpreg insn code0 in
++         ((PTree.set at_pc (Inop (snd code0)) (fst code')), (snd code'))
++     else code0.
++  
++Definition apply_checks crash_pc offset tmpreg original (code0 : code*node) : code*node :=
++  PTree.fold (apply_check crash_pc offset tmpreg) original code0.
++
++Definition crash_call :=
++  (EF_builtin "__stack_chk_fail" (mksignature nil Xvoid cc_default)).
++
++Definition crash_sequence (code0 : code * node) : code * node :=
++  let code1 := code_append code0 (fun pc => Ibuiltin crash_call nil BR_none (Pos.succ pc)) in
++  code_append code1 (fun _ => Inop (snd code0)).
++                           
++Definition transf_function (f : function) : function :=
++  let needed := canary_needed f in
++  let tmpreg := Pos.succ (max_reg_function f) in
++  let next_pc := Pos.succ (max_pc_function f) in
++  let offset := canary_offset f in
++  {| fn_sig := f.(fn_sig);
++     fn_params := f.(fn_params);
++     fn_code :=
++      if needed
++      then
++        let code0 := (f.(fn_code), next_pc) in
++        let code1 := entry_sequence f.(fn_entrypoint) offset tmpreg code0 in
++        let code2 := crash_sequence code1 in
++        let code3 := apply_checks (snd code1) offset tmpreg f.(fn_code) code2 in
++        fst code3
++      else f.(fn_code);
++    fn_stacksize :=f.(fn_stacksize) + (extra_canary_size f);
++    fn_entrypoint := if needed then next_pc else f.(fn_entrypoint) |}.
++
++Definition transf_fundef (fd: fundef) : fundef :=
++  transf_fundef transf_function fd.
++
++Definition transf_program (p: program) : program :=
++  transform_program transf_fundef p.
+diff --git a/backend/Canaryproof.v b/backend/Canaryproof.v
+new file mode 100644
+index 00000000..6ab778a3
+--- /dev/null
++++ b/backend/Canaryproof.v
+@@ -0,0 +1,1777 @@
++
++Require Import Coqlib Maps Errors Integers Floats Lattice Kildall.
++Require Import AST Linking.
++Require Import Memory Registers Op RTL Maps.
++
++Require Import Globalenvs Values.
++Require Import Linking Values Memory Globalenvs Events Smallstep.
++Require Import Registers Op RTL.
++Require Import Canary.
++
++Lemma cmp_canary_ok: forall m,
++  eval_condition canary_cmp ((canary_val tt) :: (canary_val tt) :: nil) m = Some true.
++Proof.
++  intro. unfold canary_cmp.
++  match goal with
++  | |- context [Archi.canary64] => unfold canary_val ; destruct Archi.canary64
++  | |- _ => idtac
++  end.
++  all : cbn; try rewrite Int64.eq_true; try rewrite Int.eq_true; reflexivity.
++Qed.
++
++Lemma load_canary_ok:
++  Val.load_result canary_chunk (canary_val tt) = (canary_val tt).
++Proof.
++  unfold canary_chunk, canary_val.
++  destruct Archi.canary64; reflexivity.
++Qed.
++                                            
++Lemma padding_correct : forall ofs al, (al | ofs + padding ofs al).
++Proof.
++  intros. unfold padding.
++  pose proof (Z_div_mod_eq_full ofs al) as EQ.
++  destruct zeq.
++  - rewrite e in EQ. rewrite Z.add_0_r in EQ.
++    rewrite Z.add_0_r.
++    exists (ofs / al). rewrite Z.mul_comm. assumption.
++  - replace (ofs + (al - ofs mod al)) with
++      (al * ((ofs / al) + 1)); cycle 1.
++    { rewrite EQ at 2. ring. }
++    exists (ofs / al + 1). ring.
++Qed.
++               
++Lemma canary_offset_correct: forall f,
++    ( align_chunk canary_chunk | canary_offset f).
++Proof.
++  unfold canary_offset. intros.
++  apply padding_correct.
++Qed.
++
++Lemma padding_nonneg: forall x al (POS : al > 0), 0 <= padding x al.
++Proof.
++  unfold padding. intros.
++  destruct zeq. lia.
++  assert (0 < al) as POS' by lia.
++  pose proof (Z.mod_pos_bound x al POS'). lia.
++Qed.
++
++Definition f_padding_nonneg f := padding_nonneg (fn_stacksize f) _ (align_chunk_pos canary_chunk).
++
++Lemma no_negative_stacksize : forall f,
++    canary_needed f = true -> 0 <= f.(fn_stacksize).
++Proof.
++  unfold canary_needed. intros.
++  destruct getcanary. 2: discriminate.
++  destruct zle. 2: discriminate.
++  assumption.
++Qed.
++  
++Lemma canary_load_bound: forall f,
++    canary_needed f = true ->
++    canary_offset f + size_chunk canary_chunk <= Ptrofs.modulus.
++Proof.
++  unfold canary_needed. intros f H.
++  destruct getcanary. 2: discriminate.
++  destruct zle. 2: discriminate.
++  destruct zle. 2: discriminate.
++  assert (size_chunk canary_chunk = canary_size)
++    by (unfold canary_chunk, canary_size; destruct Archi.canary64; reflexivity).
++  unfold Ptrofs.max_unsigned in *. lia.
++Qed.
++
++Lemma no_huge_stacksize : forall f,
++    canary_needed f = true -> 0 <= (canary_offset f) <= Ptrofs.max_unsigned.
++Proof.
++  unfold canary_needed. intros.
++  destruct getcanary. 2: discriminate.
++  destruct zle. 2: discriminate.
++  destruct zle. 2: discriminate.
++  assert (0 < canary_size) by (unfold canary_size; destruct Archi.canary64; lia).
++  unfold canary_offset in *.
++  pose proof (f_padding_nonneg f).
++  lia.
++Qed.
++  
++Lemma eval_getcanary: forall canary_op
++    (GET : getcanary = Some canary_op)
++    (F V: Type) (genv: Genv.t F V) sp m,                         
++    eval_operation genv sp canary_op nil m = Some (canary_val tt).
++Proof.
++  intros.
++  unfold getcanary in *; inv GET; reflexivity.
++Qed.
++
++Lemma eval_clearcanary: forall
++  (F V: Type) (genv: Genv.t F V) sp m,
++    exists v,
++    eval_operation genv sp clearcanary nil m = Some v.
++Proof.
++  intros. unfold clearcanary.
++  destruct Archi.canary64; cbn; eexists; reflexivity.
++Qed.
++
++Ltac mylia := unfold Mem.valid_block, node, Ple, Plt in *; cbn in *; lia.
++
++Lemma code_append_remain: forall pc' (st : code * node) fop (LT: Plt pc' (snd st)),
++    (fst (code_append st fop)) ! pc' = (fst st) ! pc'.
++Proof.
++  unfold code_append, Plt. intros.
++  destruct st as (co, pc). cbn in *.
++  apply PTree.gso. lia.
++Qed.
++
++Lemma code_append_incr: forall (st : code * node) fop,
++    (snd (code_append st fop)) = Pos.succ (snd st).
++Proof.
++  unfold code_append. intros.
++  destruct st as (co, pc). reflexivity.
++Qed.
++
++Lemma code_append_set: forall st fop pc (EQ : pc = (snd st)),
++    (fst (code_append st fop)) ! pc = Some (fop pc).
++Proof.
++  unfold code_append. intros. cbn.
++  destruct st. cbn in *. subst. apply PTree.gss.
++Qed.
++
++Ltac rew_code_append_remain := rewrite code_append_remain by (repeat rewrite code_append_incr ; unfold Plt in *; cbn; unfold node in *; lia).
++
++Lemma entry_sequence_remain: forall pc' entrypoint offset tmpreg st
++  (LT: Plt pc' (snd st)),
++    (fst (entry_sequence entrypoint offset tmpreg st)) ! pc' = (fst st) ! pc'.
++Proof.
++  intros. unfold entry_sequence.
++  destruct getcanary. 2: reflexivity.
++  repeat rew_code_append_remain.
++  reflexivity.
++Qed.
++
++Lemma entry_sequence_incr: forall entrypoint offset tmpreg (st: code*node),
++    Ple (snd st) (snd (entry_sequence entrypoint offset tmpreg st)).
++Proof.
++  intros. unfold entry_sequence.
++  destruct getcanary. 2: apply Ple_refl.
++  repeat rewrite code_append_incr.
++  mylia.
++Qed.
++
++Lemma entry_sequence_incr2: forall entrypoint offset tmpreg st,
++    getcanary <> None ->
++    Ple ((snd st)+3)%positive (snd (entry_sequence entrypoint offset tmpreg st)).
++Proof.
++  intros. unfold entry_sequence.
++  destruct getcanary. 2: contradiction.
++  repeat rewrite code_append_incr.
++  mylia.
++Qed.
++
++Lemma crash_sequence_remain: forall pc' st (LT: Plt pc' (snd st)),
++    (fst (crash_sequence st)) ! pc' = (fst st) ! pc'.
++Proof.
++  intros. unfold crash_sequence.
++  repeat rew_code_append_remain. reflexivity.
++Qed.
++
++Lemma crash_sequence_incr: forall st,
++    Plt (snd st) (snd (crash_sequence st)).
++Proof.
++  unfold crash_sequence. intros.
++  repeat rewrite code_append_incr. mylia.
++Qed.
++
++Lemma check_sequence_incr:
++  forall crash_pc offset tmpreg code insn,
++    Ple (snd code) (snd (check_sequence crash_pc offset tmpreg insn code)).
++Proof.
++  intros. unfold check_sequence.
++  destruct getcanary as [canary_op | ]. 2: apply Ple_refl.
++  repeat rewrite code_append_incr. mylia.
++Qed.
++
++Lemma check_sequence_remain:
++  forall crash_pc offset tmpreg code insn pc (LT : Plt pc (snd code)),
++    (fst (check_sequence crash_pc offset tmpreg insn code)) ! pc =
++      (fst code) ! pc.
++Proof.
++  intros. unfold check_sequence.
++  destruct getcanary. 2: reflexivity.
++  repeat rewrite code_append_remain. reflexivity.
++  all: repeat rewrite code_append_incr; mylia.
++Qed.
++
++Lemma apply_check_incr:
++  forall crash_pc offset tmpreg code at_pc insn,
++    Ple (snd code) (snd (apply_check crash_pc offset tmpreg code at_pc insn)).
++Proof.
++  intros. unfold apply_check.
++  destruct (check_insn insn). 2: apply Ple_refl.
++  Local Opaque check_sequence. cbn.
++  apply check_sequence_incr.
++Qed.
++
++Lemma apply_check_remain1:
++  forall crash_pc offset tmpreg code at_pc insn pc
++    (NOT_INSN: check_insn insn = false),
++    (fst (apply_check crash_pc offset tmpreg code at_pc insn)) ! pc =
++      (fst code) ! pc.
++Proof.
++  intros. unfold apply_check. rewrite NOT_INSN. reflexivity.
++Qed.
++
++Lemma apply_check_remain2:
++  forall crash_pc offset tmpreg code at_pc insn pc
++    (LT: Plt pc (snd code)) (NEQ: pc <> at_pc),
++    (fst (apply_check crash_pc offset tmpreg code at_pc insn)) ! pc =
++      (fst code) ! pc.
++Proof.
++  intros. unfold apply_check. destruct (check_insn insn); cbn.
++  - rewrite PTree.gso by congruence.
++    apply check_sequence_remain. assumption.
++  - reflexivity.
++Qed.
++  
++Lemma apply_checks_list_incr:
++  forall l crash_pc offset tmpreg code,
++  Ple (snd code)
++    (snd
++       (fold_left
++          (fun (a : RTL.code * node) (p : positive * instruction) =>
++           apply_check crash_pc offset tmpreg a (fst p) (snd p))
++          l code)).
++Proof.
++  induction l; intros; cbn. apply Ple_refl.
++  eapply Ple_trans.
++  - apply apply_check_incr.
++  - apply IHl.
++Qed.
++  
++Lemma apply_checks_list_remain:
++  forall l crash_pc offset tmpreg code pc
++    (LT: Plt pc (snd code))
++    (NOT_INSN: forall insn, In (pc, insn) l -> check_insn insn = false),
++    (fst
++       (fold_left
++          (fun (a : RTL.code * node) (p : positive * instruction) =>
++           apply_check crash_pc offset tmpreg a (fst p) (snd p))
++          l code)) ! pc = (fst code) ! pc.
++Proof.
++  induction l; intros; cbn. reflexivity.
++  rewrite IHl; cycle 1.
++  { pose proof (apply_check_incr crash_pc offset tmpreg code (fst a) (snd a)).
++    mylia. }
++  { intros. apply NOT_INSN. right. assumption. }
++  destruct (peq pc (fst a)).
++  { subst.
++    apply apply_check_remain1.
++    apply NOT_INSN. left. destruct a. reflexivity. }
++  apply apply_check_remain2; assumption.
++Qed.
++
++Lemma apply_checks_incr:
++  forall crash_pc offset tmpreg original_code code,
++    Ple (snd code) (snd (apply_checks crash_pc offset tmpreg original_code code)).
++Proof.
++  intros. unfold apply_checks. rewrite PTree.fold_spec.
++  apply apply_checks_list_incr.
++Qed.
++
++Lemma apply_checks_remain:
++  forall crash_pc offset tmpreg original_code code pc
++    (LT: Plt pc (snd code))
++    (NOT_INSN: forall insn, original_code ! pc = Some insn ->
++                            check_insn insn = false),
++    (fst (apply_checks crash_pc offset tmpreg original_code code)) ! pc =
++      (fst code) ! pc.
++Proof.
++  intros. unfold apply_checks. rewrite PTree.fold_spec.
++  apply apply_checks_list_remain. assumption.
++  intros. apply NOT_INSN.
++  apply PTree.elements_complete. assumption.
++Qed.
++
++Local Opaque canary_needed entry_sequence crash_sequence.
++
++Ltac use_entry_sequence_incr :=
++  match goal with | |- context [ entry_sequence ?a ?b ?c ?d ] =>
++                        pose proof (entry_sequence_incr a b c d) end.
++
++Ltac use_crash_sequence_incr :=
++  match goal with | |- context [ crash_sequence ?a ] =>
++                        pose proof (crash_sequence_incr a) end.
++
++Local Transparent canary_needed.
++Lemma canary_exists_if_needed: forall f, canary_needed f = true -> (getcanary <> None).
++Proof.
++  unfold canary_needed. intros. destruct getcanary; discriminate.
++Qed.
++
++Ltac use_entry_sequence_incr2 :=
++  match goal with | NEEDED: canary_needed ?f = true
++               |- context [ entry_sequence ?a ?b ?c ?d ] =>
++                        pose proof (entry_sequence_incr2 a b c d (canary_exists_if_needed _ NEEDED)) as ENTRY_INCR end.
++
++Lemma transf_code:
++  forall f pc i,
++  f.(fn_code)!pc = Some i -> ((check_insn i) && (canary_needed f) = false) ->
++  (transf_function f).(fn_code)!pc = Some i.
++Proof.
++  intros.
++  assert (Ple pc (max_pc_function f)) as LE.
++  { eapply max_pc_function_sound; eassumption. }
++  unfold transf_function.
++  destruct canary_needed; cbn. 2: assumption.
++  rewrite apply_checks_remain.
++  - rewrite crash_sequence_remain.
++    + rewrite entry_sequence_remain; cbn. assumption. mylia.
++    + use_entry_sequence_incr. mylia.
++  - use_crash_sequence_incr. use_entry_sequence_incr. mylia.
++  - intros.
++    replace i with insn in H0 by congruence.
++    rewrite andb_true_r in H0. assumption.
++Qed.
++
++Record has_check_sequence f pc code' (chk_pc' : node) : Prop :=
++  {  chk_crash_pc : node;
++     chk_tmpreg : positive;
++     chk_canary_op : operation;
++     tmp_reg_ok : Plt (max_reg_function f) chk_tmpreg;
++     chk_canary_op_ok : getcanary = Some chk_canary_op;
++     chk_jump: code' ! pc = Some (Inop chk_pc');
++     chk_load: code' ! chk_pc' =
++        Some (Iload canary_chunk (Ainstack (Ptrofs.repr (canary_offset f)))
++          nil chk_tmpreg (Pos.succ chk_pc'));
++     chk_canary: code' ! (Pos.succ chk_pc') =
++        Some (Iop chk_canary_op nil (Pos.succ chk_tmpreg) (chk_pc' + 2)%positive);
++     chk_cond: code' ! (chk_pc' + 2)%positive =
++        Some (Icond (negate_condition canary_cmp)
++                       (chk_tmpreg :: (Pos.succ chk_tmpreg) :: nil)
++                      chk_crash_pc (chk_pc' + 3)%positive) ;
++     chk_insn: code' ! (chk_pc' + 3)%positive =
++                 f.(fn_code) ! pc
++  }.
++
++Ltac use_apply_check_incr :=
++  match goal with
++  | |- context[apply_check ?a ?b ?c ?d ?e ?f] =>
++      pose proof (apply_check_incr a b c d e f)
++  end.
++         
++Lemma apply_check_has:
++  forall f crash_pc tmpreg code at_pc insn canary_op
++    (AT_CODE: f.(fn_code) ! at_pc = Some insn)
++    (AT_PC: Plt at_pc (snd code))
++    (TMPREG: Plt (max_reg_function f) tmpreg)
++    (CANARY_OP : getcanary = Some canary_op)
++    (CHECK_INSN: check_insn insn = true),
++    has_check_sequence f at_pc
++      (fst (apply_check crash_pc (canary_offset f) tmpreg code at_pc insn))
++      (snd code).
++Proof.
++  intros.
++  unfold apply_check. rewrite CHECK_INSN.
++  Local Transparent check_sequence.
++  unfold check_sequence. rewrite CANARY_OP.
++
++  apply Build_has_check_sequence with (chk_pc' := (snd code))
++        (chk_crash_pc := crash_pc) (chk_tmpreg := tmpreg)
++        (chk_canary_op := canary_op); trivial; cbn.
++  { apply PTree.gss. }
++  all: rewrite PTree.gso by mylia.
++  - rewrite code_append_remain.
++    rewrite code_append_remain.
++    rewrite code_append_remain.
++    { rewrite code_append_set; reflexivity. }
++    all: repeat rewrite code_append_incr; mylia.
++  - rewrite code_append_remain.
++    rewrite code_append_remain.
++    { rewrite code_append_set.
++      - repeat f_equal. lia.
++      - rewrite code_append_incr. reflexivity. }
++    all: repeat rewrite code_append_incr; mylia.
++  - rewrite code_append_remain.
++    { rewrite code_append_set.
++      - repeat f_equal. lia.
++      - repeat rewrite code_append_incr. mylia. }
++    all: repeat rewrite code_append_incr; mylia.
++  - rewrite code_append_set. congruence.
++    repeat rewrite code_append_incr; mylia.
++Qed.
++
++Lemma norepet_noway:
++  forall {A B : Type} a b (l : list (A*B))
++    (NOREPET: list_norepet (map fst ((a,b)::l)))
++      (P: Prop) b'
++      (IN : In (a, b') l), P.
++Proof.
++  intros. exfalso. inv NOREPET. apply H1.
++  change a with (fst (a, b')).
++  apply in_map. assumption.
++Qed.
++
++Lemma correct_positions: forall {B : Type} a c (l: list (positive*B))
++  (AT_PC : Plt c a)
++  (ALL : Forall (fun x => Ple x c) (map fst l))
++  (P: Prop) b
++  (IN : In (a,b) l), P.
++Proof.
++  induction l; intros; exfalso. exact IN.
++  inv ALL.
++  destruct IN as [FIRST | OTHER].
++  { subst a0. mylia. }
++  eapply IHl; eassumption.
++Qed.
++
++Local Opaque getcanary.
++
++Lemma apply_checks_has_list:
++  forall l f crash_pc tmpreg code at_pc insn canary_op
++         (IN_LIST: In (at_pc, insn) l)
++         (NOREPET: list_norepet (map fst l))
++         (LOW: Forall (fun pc => Ple pc (max_pc_function f)) (map fst l))
++    (AT_CODE: f.(fn_code) ! at_pc = Some insn)
++    (AT_PC: Plt (max_pc_function f) (snd code))
++    (TMPREG: Plt (max_reg_function f) tmpreg)
++    (CANARY_OP : getcanary = Some canary_op)
++    (CHECK_INSN: check_insn insn = true),
++    exists pc',
++    has_check_sequence f at_pc
++      (fst
++       (fold_left
++          (fun (a : RTL.code * node) (p : positive * instruction) =>
++           apply_check crash_pc (canary_offset f) tmpreg a (fst p) (snd p))
++          l code)) pc'.
++Proof.
++  induction l; cbn; intros. exfalso. assumption.
++  destruct IN_LIST.
++  - subst a. cbn.
++    assert (AT_PC' : Plt at_pc (snd code)).
++    { pose proof (max_pc_function_sound _ _ _ AT_CODE). mylia. }
++    destruct (apply_check_has f crash_pc tmpreg code at_pc insn canary_op AT_CODE AT_PC' TMPREG CANARY_OP CHECK_INSN).
++    exists (snd code).
++    eapply (Build_has_check_sequence f at_pc); try eassumption.
++    + rewrite apply_checks_list_remain.
++      * eassumption.
++      * use_apply_check_incr. mylia.
++      * intros. eapply norepet_noway; eassumption.
++    + rewrite apply_checks_list_remain.
++      * eassumption.
++      * unfold apply_check. rewrite CHECK_INSN. cbn.
++        unfold check_sequence. rewrite CANARY_OP. cbn.
++        repeat rewrite code_append_incr. mylia.
++      * inv LOW. intros.
++        eapply correct_positions. 2: exact H2. all: eassumption.
++    + rewrite apply_checks_list_remain.
++      * eassumption.
++      * unfold apply_check. rewrite CHECK_INSN. cbn.
++        unfold check_sequence. rewrite CANARY_OP. cbn.
++        repeat rewrite code_append_incr. mylia.
++      * inv LOW. intros.
++        eapply correct_positions. 2: exact H2. 2: eassumption.
++        mylia.
++    + rewrite apply_checks_list_remain.
++      * eassumption.
++      * unfold apply_check. rewrite CHECK_INSN. cbn.
++        unfold check_sequence. rewrite CANARY_OP. cbn.
++        repeat rewrite code_append_incr. mylia.
++      * inv LOW. intros.
++        eapply correct_positions. 2: exact H2. 2: eassumption.
++        mylia.
++    + rewrite apply_checks_list_remain.
++      * eassumption.
++      * unfold apply_check. rewrite CHECK_INSN. cbn.
++        unfold check_sequence. rewrite CANARY_OP. cbn.
++        repeat rewrite code_append_incr. mylia.
++      * inv LOW. intros.
++        eapply correct_positions. 2: exact H2. 2: eassumption.
++        mylia.
++        
++  - apply IHl with (canary_op := canary_op) (insn := insn); trivial.
++    { inv NOREPET. assumption. }
++    { inv LOW. assumption. }
++    use_apply_check_incr. mylia.
++Qed.
++
++Lemma apply_checks_has:
++  forall f crash_pc tmpreg code at_pc insn canary_op
++    (AT_CODE: f.(fn_code) ! at_pc = Some insn)
++    (AT_PC: Plt (max_pc_function f) (snd code))
++    (TMPREG: Plt (max_reg_function f) tmpreg)
++    (CANARY_OP : getcanary = Some canary_op)
++    (CHECK_INSN: check_insn insn = true),
++    exists pc',
++    has_check_sequence f at_pc
++                       (fst (apply_checks crash_pc (canary_offset f) tmpreg f.(fn_code) code)) pc'.
++Proof.
++  intros. unfold apply_checks. rewrite PTree.fold_spec.
++  apply apply_checks_has_list with (insn:=insn) (canary_op:=canary_op); trivial.
++  - apply PTree.elements_correct. assumption.
++  - apply PTree.elements_keys_norepet.
++  - rewrite Forall_forall. intros.
++    destruct (list_in_map_inv _ _ _ H) as ((x0,y0) & FST & IN).
++    apply max_pc_function_sound with (i := y0).
++    apply PTree.elements_complete. subst. exact IN.
++Qed.
++ 
++Lemma transf_code_chk:
++  forall f pc insn
++         (AT_CODE : f.(fn_code)!pc = Some insn)
++         (INSERTED: ((check_insn insn) && (canary_needed f) = true)),
++    exists pc',
++  has_check_sequence f pc (transf_function f).(fn_code) pc'.
++Proof.
++  intros.
++  pose proof (max_pc_function_sound _ _ _ AT_CODE).
++  rewrite andb_true_iff in INSERTED.
++  destruct INSERTED as (CHECK & NEEDED).
++  unfold transf_function.
++  rewrite NEEDED. cbn.
++  unfold canary_needed in *.
++  destruct getcanary as [canary_op | ] eqn:CANARY_OP. 2: discriminate.
++  apply apply_checks_has with (insn:=insn) (canary_op:=canary_op); trivial.
++  - use_crash_sequence_incr.
++    use_entry_sequence_incr. mylia.
++  - mylia.
++Qed.
++
++Local Transparent canary_needed getcanary.
++Lemma extra_canary_size_0_if_incorrect_size: forall f,
++    f.(fn_stacksize) < 0 -> extra_canary_size f = 0.
++Proof.
++  unfold extra_canary_size, canary_needed. intros.
++  destruct (zle 0 f.(fn_stacksize)); cbn; lia.
++Qed.
++
++Definition match_prog (p tp: RTL.program) :=
++  match_program (fun ctx f tf => tf = transf_fundef f) eq p tp.
++
++Lemma transf_program_match:
++  forall p, match_prog p (transf_program p).
++Proof.
++  intros. eapply match_transform_program; eauto.
++Qed.
++
++Section PRESERVATION.
++
++Variables prog tprog: program.
++Hypothesis TRANSL: match_prog prog tprog.
++Let ge := Genv.globalenv prog.
++Let tge := Genv.globalenv tprog.
++
++Lemma functions_translated:
++  forall v f,
++  Genv.find_funct ge v = Some f ->
++  Genv.find_funct tge v = Some (transf_fundef f).
++Proof (Genv.find_funct_transf TRANSL).
++
++Lemma function_ptr_translated:
++  forall v f,
++  Genv.find_funct_ptr ge v = Some f ->
++  Genv.find_funct_ptr tge v = Some (transf_fundef f).
++Proof (Genv.find_funct_ptr_transf TRANSL).
++
++Lemma symbols_preserved:
++  forall id,
++  Genv.find_symbol tge id = Genv.find_symbol ge id.
++Proof (Genv.find_symbol_transf TRANSL).
++
++Lemma senv_preserved:
++  Senv.equiv ge tge.
++Proof (Genv.senv_transf TRANSL).
++
++Lemma sig_preserved:
++  forall f, funsig (transf_fundef f) = funsig f.
++Proof.
++  destruct f; reflexivity.
++Qed.
++
++Lemma find_function_translated:
++  forall ros rs fd,
++  find_function ge ros rs = Some fd ->
++  find_function tge ros rs = Some (transf_fundef fd).
++Proof.
++  unfold find_function; intros. destruct ros as [r|id].
++  eapply functions_translated; eauto.
++  rewrite symbols_preserved. destruct (Genv.find_symbol ge id); try congruence.
++  eapply function_ptr_translated; eauto.
++Qed.
++
++Definition match_regs (fn : function) (rs rs' : regset) :=
++  (forall r, (r <= RTL.max_reg_function fn)%positive -> Val.lessdef (rs#r) (rs'#r) ) /\(
++  forall r, (RTL.max_reg_function fn < r)%positive -> rs#r = Vundef).
++
++Lemma match_regs_params:
++  forall f params args args'
++         (LESSDEF : Val.lessdef_list args args')
++         (ALL : List.Forall (fun x => (x <= max_reg_function f)%positive) params),
++         match_regs f (init_regs args params)
++                    (init_regs args' params).
++Proof.
++  induction params; intros.
++  { split. constructor. intros. constructor. }
++  cbn. inv LESSDEF; unfold match_regs in *; intros.
++  { split. constructor. intros. apply Regmap.gi. }
++  inv ALL.
++  destruct (IHparams _ _ H0 H4) as (IHparams1 & IHparams2).
++  split; intros.
++  - destruct (peq a r).
++    { subst a. repeat rewrite Regmap.gss. assumption.
++    }
++    repeat rewrite Regmap.gso by congruence.
++    apply IHparams1; trivial.
++  - rewrite Regmap.gso by lia.
++    apply IHparams2; trivial.
++Qed.
++
++Definition canary_perm m f sp :=
++  Mem.range_perm m sp (f.(fn_stacksize)) (f.(fn_stacksize) + (extra_canary_size f))
++                 Cur Freeable.
++
++Definition f_out_of_bounds m f sp :=
++  forall ofs (BEYOND : f.(fn_stacksize) <= ofs),
++    loc_out_of_bounds m sp ofs.
++
++Definition canary_present m f sp :=
++  canary_needed f = true -> Mem.load canary_chunk m sp (canary_offset f) = Some (canary_val tt).
++
++Lemma canary_present_store:
++  forall f sp chunk m m' b i v v' m2 m2' 
++    (EXTENDS: Mem.extends m m')
++    (STORE: Mem.store chunk m b i v = Some m2)
++    (STORE': Mem.store chunk m' b i v' = Some m2')
++    (OUT_OF_BOUNDS : f_out_of_bounds m f sp)
++    (PRESENT: canary_present m' f sp),
++    canary_present m2' f sp.
++Proof.
++  intros.
++  unfold canary_present, f_out_of_bounds, loc_out_of_bounds in *.
++  destruct canary_needed. 2: discriminate.
++  intro TRUE. cbn in *.
++  pose proof (PRESENT TRUE) as CANARY.
++  clear PRESENT TRUE.
++  erewrite Mem.load_store_other.
++  exact CANARY.
++  exact STORE'.
++  destruct (peq b sp).
++  2: left; congruence.
++  right.
++  subst b.
++  unfold not in OUT_OF_BOUNDS.
++  destruct (Mem.store_valid_access_3 _ _ _ _ _ _ STORE) as (RANGE_PERM & ALIGNED).
++  assert(i <= (i + size_chunk chunk - 1) <
++           (i + size_chunk chunk)) as RANGE by (pose proof (size_chunk_pos chunk); lia).
++  pose proof (RANGE_PERM _ RANGE) as PERM.
++  destruct (Z.lt_ge_cases (i + size_chunk chunk - 1)
++                          f.(fn_stacksize)) as [LT | GE]; cycle 1.
++  { exfalso.
++    apply (OUT_OF_BOUNDS _ GE). apply Mem.perm_cur_max.
++    eapply Mem.perm_implies. eassumption. constructor. }
++  right.
++  unfold canary_offset.
++  pose proof (f_padding_nonneg f). lia.
++Qed.
++
++Local Opaque canary_present.
++
++Lemma canary_present_storev:
++  forall f sp chunk m m' a a' v v' m2 m2' 
++    (EXTENDS: Mem.extends m m')
++    (LESSDEF: Val.lessdef a a')
++    (STORE: Mem.storev chunk m a v = Some m2)
++    (STORE': Mem.storev chunk m' a' v' = Some m2')
++    (OUT_OF_BOUNDS : f_out_of_bounds m f sp)
++    (PRESENT: canary_present m' f sp),
++    canary_present m2' f sp.
++Proof.
++  destruct a; intros; try discriminate; inv LESSDEF.
++  unfold Mem.storev in *. destruct zle; try discriminate.
++  eapply canary_present_store; eassumption.
++Qed.
++
++Inductive match_stacks: block -> mem -> mem -> list RTL.stackframe -> list RTL.stackframe -> Prop :=
++| match_frames_nil: forall bound m m', match_stacks bound m m' nil nil
++| match_frames_cons: forall bound m m' tail tail'
++           res f sp pc rs rs' (REGS : match_regs f rs rs')
++           (REG_OK : (res <= max_reg_function f)%positive)
++           (VALID_SP: Plt sp bound)
++           (CANARY_PERM : canary_perm m' f sp)
++           (OUT_OF_BOUNDS : f_out_of_bounds m f sp)
++           (CANARY_PRESENT: canary_present m' f sp)
++           (TAIL: match_stacks sp m m' tail tail'),
++  match_stacks bound m m'
++    ((Stackframe res f (Vptr sp Ptrofs.zero) pc rs) :: tail)
++    ((Stackframe res (transf_function f) (Vptr sp Ptrofs.zero) pc rs') :: tail').
++
++Lemma canary_perm_store: forall m1 m2 f sp0 chunk b0 ofs0 v
++  (CANARY_PERM : canary_perm m1 f sp0)
++  (STORE : Mem.store chunk m1 b0 ofs0 v = Some m2),
++    canary_perm m2 f sp0.
++Proof.
++  unfold canary_perm. intros.
++  intros ofs RANGE.
++  eapply Mem.perm_store_1. eassumption.
++  apply CANARY_PERM. assumption.
++Qed.
++
++Lemma canary_perm_storev: forall m1 m2 f sp0 chunk a v
++  (CANARY_PERM : canary_perm m1 f sp0)
++  (STORE : Mem.storev chunk m1 a v = Some m2),
++    canary_perm m2 f sp0.
++Proof.
++  unfold Mem.storev. intros.
++  destruct a; try discriminate.
++  destruct zle; try discriminate.
++  eapply canary_perm_store; eassumption.
++Qed.
++
++Lemma f_out_of_bounds_store: forall m1 m2 f sp0 chunk b ofs0 v
++  (CANARY_PERM : f_out_of_bounds m1 f sp0)
++  (STORE : Mem.store chunk m1 b ofs0 v = Some m2),
++    f_out_of_bounds m2 f sp0.
++Proof.
++  unfold f_out_of_bounds. intros.
++  unfold loc_out_of_bounds in *. intro PERM.
++  apply Mem.perm_store_2 with (m1:=m1) (chunk:=chunk) (b:=b) (ofs:=ofs0) (v := v) in PERM.
++  pose proof (CANARY_PERM ofs BEYOND).
++  contradiction.
++  assumption.
++Qed.
++
++Lemma f_out_of_bounds_storev: forall m1 m2 f sp0 chunk a v
++  (CANARY_PERM : f_out_of_bounds m1 f sp0)
++  (STORE : Mem.storev chunk m1 a v = Some m2),
++    f_out_of_bounds m2 f sp0.
++Proof.
++  unfold Mem.storev. intros.
++  destruct a; try discriminate.
++  destruct zle; try discriminate.
++  eapply f_out_of_bounds_store; eassumption.
++Qed.
++
++Lemma f_out_of_bounds_free: forall m1 m2 f sp0 b lo hi
++  (CANARY_PERM : f_out_of_bounds m1 f sp0)
++  (FREE : Mem.free m1 b lo hi = Some m2),
++    f_out_of_bounds m2 f sp0.
++Proof.
++  intros. unfold f_out_of_bounds, loc_out_of_bounds in *.
++  intros ofs RANGE.
++  pose proof (CANARY_PERM ofs RANGE) as PERM.
++  intro PERM2. apply PERM.
++  exact (Mem.perm_free_3 _ _ _ _ _ FREE _ _ _ _ PERM2).
++Qed.
++  
++Lemma canary_perm_free: forall m1 m2 f sp0 b lo hi
++  (NEQ: sp0 <> b)
++  (CANARY_PERM : canary_perm m1 f sp0)
++  (FREE : Mem.free m1 b lo hi = Some m2),
++    canary_perm m2 f sp0.
++Proof.
++  intros. unfold canary_perm in *.
++  intros ofs RANGE.
++  eapply Mem.perm_free_1.
++  - eassumption.
++  - left. assumption.
++  - apply CANARY_PERM; lia.
++Qed.
++
++Local Transparent canary_present.
++Lemma canary_present_free: forall m1 m2 f sp0 b lo hi
++  (NEQ: sp0 <> b)
++  (CANARY_PERM : canary_present m1 f sp0)
++  (FREE : Mem.free m1 b lo hi = Some m2),
++    canary_present m2 f sp0.
++Proof.
++  intros. unfold canary_present in *.
++  destruct canary_needed. 2: discriminate.
++  intro TRUE. pose proof (CANARY_PERM TRUE) as LOAD.
++  clear CANARY_PERM TRUE.
++  erewrite Mem.load_free; try eassumption.
++  left. assumption.
++Qed.
++
++Lemma f_out_of_bounds_alloc: forall m1 m2 f sp0 b lo hi
++  (VALID : Mem.valid_block m1 sp0)
++  (OUT_OF_BOUNDS : f_out_of_bounds m1 f sp0)
++  (ALLOC : Mem.alloc m1 lo hi = (m2, b)),
++    f_out_of_bounds m2 f sp0.
++Proof.
++  unfold Mem.valid_block, f_out_of_bounds, loc_out_of_bounds, Plt in *. intros.
++  intro PERM2.
++  apply (OUT_OF_BOUNDS ofs BEYOND).
++  eapply Mem.perm_alloc_4; try eassumption.
++  erewrite <- Mem.alloc_result in VALID by eassumption.
++  lia.
++Qed.
++  
++Lemma canary_perm_alloc: forall m1 m2 f sp0 b lo hi
++  (CANARY_PERM : canary_perm m1 f sp0)
++  (ALLOC : Mem.alloc m1 lo hi = (m2, b)),
++    canary_perm m2 f sp0.
++Proof.
++  unfold canary_perm in *. intros.
++  intros ofs RANGE.
++  eapply Mem.perm_alloc_1. eassumption.
++  apply CANARY_PERM. assumption.
++Qed.
++  
++Lemma canary_present_alloc: forall m1 m2 f sp0 b lo hi
++  (CANARY_PERM : canary_present m1 f sp0)
++  (ALLOC : Mem.alloc m1 lo hi = (m2, b)),
++    canary_present m2 f sp0.
++Proof.
++  intros.
++  unfold canary_present in *.
++  intro TRUE.
++  pose proof (CANARY_PERM TRUE) as LOAD.
++  clear CANARY_PERM TRUE.
++  erewrite Mem.load_alloc_other; try eassumption.
++  reflexivity.
++Qed.
++
++Lemma f_out_of_bounds_external_call:
++  forall ef ge vargs t vres m1 m2 f sp
++         (VALID_SP: Mem.valid_block m1 sp)
++         (OUT_OF_BOUNDS: f_out_of_bounds m1 f sp)
++         (EXTCALL: external_call ef ge vargs m1 t vres m2),
++    f_out_of_bounds m2 f sp.
++Proof.
++  intros. unfold f_out_of_bounds, loc_out_of_bounds in *.
++  intros ofs RANGE. pose proof (OUT_OF_BOUNDS ofs RANGE) as OOB.
++  intro PERM2. apply OOB.
++  eapply external_call_max_perm; eassumption.
++Qed.
++
++Lemma canary_perm_external_call:
++  forall ef ge vargs vargs' t vres vres' m1 m1' m2 m2' f sp
++         (CANARY_PERM : canary_perm m1' f sp)
++         (VALID_SP : Mem.valid_block m1' sp)
++         (OUT_OF_BOUNDS: f_out_of_bounds m1 f sp)
++         (EXTCALL: external_call ef ge vargs m1 t vres m2)
++         (EXTCALL': external_call ef ge vargs' m1' t vres' m2')
++         (UNCHANGED: Mem.unchanged_on (loc_out_of_bounds m1) m1' m2'),
++    canary_perm m2' f sp.
++Proof.
++  intros.
++  destruct UNCHANGED.
++  unfold canary_perm in *.
++  intros ofs RANGE.
++  rewrite <- unchanged_on_perm.
++  3: assumption.
++  { apply CANARY_PERM. assumption. }
++  unfold f_out_of_bounds in *.
++  apply OUT_OF_BOUNDS. lia.
++Qed.
++
++Lemma canary_present_external_call:
++  forall ef ge vargs vargs' t vres vres' m1 m1' m2 m2' f sp
++         (CANARY_PRESENT : canary_present m1' f sp)
++         (VALID_SP : Mem.valid_block m1' sp)
++         (OUT_OF_BOUNDS: f_out_of_bounds m1 f sp)
++         (EXTCALL: external_call ef ge vargs m1 t vres m2)
++         (EXTCALL': external_call ef ge vargs' m1' t vres' m2')
++         (UNCHANGED: Mem.unchanged_on (loc_out_of_bounds m1) m1' m2'),
++    canary_present m2' f sp.
++Proof.
++  intros. unfold canary_present in *.
++  intro TRUE. pose proof (CANARY_PRESENT TRUE) as LOAD.
++  clear CANARY_PRESENT.
++  erewrite Mem.load_unchanged_on_1; try eassumption.
++  unfold f_out_of_bounds, loc_out_of_bounds in *.
++  intros. apply OUT_OF_BOUNDS.
++  unfold canary_offset in *.
++  pose proof (f_padding_nonneg f). lia.
++Qed.
++
++Lemma match_stacks_advance:
++  forall bound bound2 (LE: Ple bound bound2) m m' stk stk'
++         (STACKS : match_stacks bound m m' stk stk'),
++    match_stacks bound2 m m' stk stk'.
++Proof.
++  induction stk; intros; inv STACKS.
++  { constructor. }
++  constructor; trivial.
++  unfold Ple, Plt in *. lia.
++Qed.
++
++Lemma match_stacks_storev:
++  forall stk stk' bound m m' m2 m2' chunk a a' v v'
++         (EXTENDS: Mem.extends m m')
++         (LESSDEF: Val.lessdef a a')
++         (STORE: Mem.storev chunk m a v = Some m2)
++         (STORE': Mem.storev chunk m' a' v' = Some m2')
++         (STACKS: match_stacks bound m m' stk stk'),
++    match_stacks bound m2 m2' stk stk'.
++Proof.
++  induction stk; intros; inv STACKS.
++  { constructor. }
++  constructor; trivial.
++  - eapply canary_perm_storev; eassumption.
++  - eapply f_out_of_bounds_storev; eassumption.
++  - eapply canary_present_storev; eassumption.
++  - eapply IHstk; eassumption.
++Qed.
++
++Lemma match_stacks_free:
++  forall stk stk' bound m m' b lo lo' hi hi' m2 m2'
++         (STORE: Mem.free m b lo hi = Some m2)
++         (STORE': Mem.free m' b lo' hi' = Some m2')
++         (STACKS: match_stacks bound m m' stk stk')
++         (LE: Ple bound b),
++    match_stacks bound m2 m2' stk stk'.
++Proof.
++  induction stk; intros; inv STACKS.
++  { constructor. }
++  constructor; trivial.
++  - eapply canary_perm_free. 2,3: eassumption.
++    mylia.
++  - eapply f_out_of_bounds_free; eassumption.
++  - eapply canary_present_free. 2,3: eassumption.
++    mylia.
++  - eapply IHstk; try eassumption.
++    unfold Ple, Plt in *. lia.
++Qed.
++
++Lemma match_stacks_alloc:
++  forall stk stk' bound m m' lo lo' hi hi' m2 m2' b b'
++         (VALID : Ple bound (Mem.nextblock m))
++         (STORE: Mem.alloc m lo hi = (m2, b))
++         (STORE': Mem.alloc m' lo' hi' = (m2', b'))
++         (STACKS: match_stacks bound m m' stk stk'),
++    match_stacks bound m2 m2' stk stk'.
++Proof.
++  induction stk; intros; inv STACKS.
++  { constructor. }
++  constructor; trivial.
++  - eapply canary_perm_alloc; eassumption.
++  - eapply f_out_of_bounds_alloc with (m1 := m). 2, 3: eassumption.
++    mylia.
++  - eapply canary_present_alloc; eassumption.
++  - eapply IHstk. 2,3,4: eassumption. mylia.
++Qed.
++
++Lemma match_stacks_external_call:
++  forall stk stk' ef ge vargs vargs' t vres vres' m1 m1' m2 m2' f sp
++         (MEM: Mem.extends m1 m1')
++         (VALID_SP : Mem.valid_block m1 sp)
++         (OUT_OF_BOUNDS: f_out_of_bounds m1 f sp)
++         (EXTCALL: external_call ef ge vargs m1 t vres m2)
++         (EXTCALL': external_call ef ge vargs' m1' t vres' m2')
++         (UNCHANGED: Mem.unchanged_on (loc_out_of_bounds m1) m1' m2')
++         (STACKS: match_stacks sp m1 m1' stk stk'),
++    match_stacks sp m2 m2' stk stk'.
++Proof.
++  induction stk; intros; inv STACKS.
++  { constructor. }
++  constructor; trivial.
++  - eapply canary_perm_external_call; try eassumption.
++    rewrite <- Mem.valid_block_extends by eassumption. mylia.
++  - eapply f_out_of_bounds_external_call; try eassumption. mylia.
++  - eapply canary_present_external_call; try eassumption.
++    rewrite <- Mem.valid_block_extends by eassumption. mylia.
++  - eapply IHstk; try eassumption. mylia.
++Qed.
++
++Inductive match_states: RTL.state -> RTL.state -> Prop :=
++| match_regular_states: forall stk stk' f sp pc rs rs' m m'
++        (VALID_SP: Mem.valid_block m sp)
++        (CANARY_PERM : canary_perm m' f sp)
++        (OUT_OF_BOUNDS : f_out_of_bounds m f sp)                       
++        (CANARY_PRESENT: canary_present m' f sp)
++        (REGS : match_regs f rs rs')
++        (MEM: Mem.extends m m')                       
++        (STACKS: match_stacks sp m m' stk stk'),
++      match_states (State stk f (Vptr sp Ptrofs.zero) pc rs m)
++                   (State stk' (transf_function f) (Vptr sp Ptrofs.zero) pc rs' m')
++  | match_callstates: forall stk stk' f args args' m m'
++        (MEM: Mem.extends m m')                       
++        (STACKS: match_stacks (Mem.nextblock m) m m' stk stk')
++        (ARGS : Val.lessdef_list args args'),
++      match_states (Callstate stk f args m)
++                   (Callstate stk' (transf_fundef f) args' m')
++  | match_returnstates: forall stk stk' v v' m m'
++        (MEM: Mem.extends m m')                       
++        (STACKS: match_stacks (Mem.nextblock m) m m' stk stk')
++        (RES: Val.lessdef v v'),
++      match_states (Returnstate stk v m)
++                   (Returnstate stk' v' m').
++
++Lemma match_regs_args : forall args f rs rs'
++    (MATCH_REGS : match_regs f rs rs')
++    (ARGS_OK : forall r, In r args -> (r <= (max_reg_function f))%positive),
++    Val.lessdef_list (rs ## args) (rs' ## args).
++Proof.
++  unfold match_regs. induction args; intros; cbn; constructor.
++  - apply MATCH_REGS. apply ARGS_OK. left. reflexivity.
++  - apply IHargs with (f:=f). apply MATCH_REGS.
++    intros. apply ARGS_OK. right. assumption.
++Qed.
++      
++Lemma match_regs_assign :
++  forall f rs rs' res v v' 
++         (RES_OK : (res <= (max_reg_function f))%positive)
++         (MATCH_REGS : match_regs f rs rs')
++         (INJECT : Val.lessdef v v'),                        
++    match_regs f (rs # res <- v) (rs' # res <- v').
++Proof.
++  unfold match_regs. intros.
++  destruct MATCH_REGS as (REGS1 & REGS2).
++  split; intros.
++  - destruct (peq r res).
++    { subst r. repeat rewrite Regmap.gss. assumption. }
++    repeat rewrite Regmap.gso by congruence.
++    auto.
++  - rewrite Regmap.gso by lia. auto.
++Qed.
++
++Lemma extra_canary_size_nonneg: forall f, 0 <= extra_canary_size f.
++Proof.
++  unfold extra_canary_size. intros.
++  destruct canary_needed. 2: lia.
++  pose proof (f_padding_nonneg f).
++  unfold canary_size.
++  destruct Archi.canary64; lia.
++Qed.
++
++Lemma mem_storev_valid_block_1:
++  forall m m2 chunk a v sp,
++    Mem.valid_block m sp ->
++    Mem.storev chunk m a v = Some m2 ->
++    Mem.valid_block m2 sp.
++Proof.
++  intros.
++  destruct a; cbn in *; try discriminate.
++  destruct zle; try discriminate.
++  eapply Mem.store_valid_block_1; eassumption.
++Qed.
++
++Lemma free_with_canary:
++  forall m m' m2 stk f
++         (FREE : Mem.free m stk 0 (fn_stacksize f) = Some m2)
++         (MEM : Mem.extends m m')
++         (OUT_OF_BOUNDS : f_out_of_bounds m f stk)
++         (CANARY_PERM : canary_perm m' f stk),
++    exists m2',
++      Mem.free m' stk 0 (fn_stacksize (transf_function f)) = Some m2' /\
++        (Mem.extends m2 m2').
++Proof.
++  intros.
++  assert(RANGE_PERM' : Mem.range_perm m' stk 0 (fn_stacksize (transf_function f)) Cur Freeable).
++  { pose proof (Mem.free_range_perm _ _ _ _ _ FREE) as RANGE_PERM.
++    intros ofs RANGE.
++    assert (ofs < fn_stacksize f \/ ofs >= fn_stacksize f) as ZZ by lia.
++    destruct ZZ.
++    - apply Mem.perm_extends with (m1 := m). assumption.
++      apply RANGE_PERM. lia.
++    - unfold canary_perm in CANARY_PERM.
++      apply CANARY_PERM. cbn in RANGE. lia.
++  }
++  destruct (Mem.range_perm_free _ _ _ _ RANGE_PERM') as (m2' & FREE').
++  exists m2'. split. assumption.
++  eapply Mem.free_right_extends. 2: eassumption.
++  { eapply Mem.extends_extends_compose. 2: eassumption.
++    eapply Mem.free_left_extends.
++    apply Mem.extends_refl. eassumption. }
++  intros.
++  assert (ofs < fn_stacksize f \/ fn_stacksize f <= ofs) as ZZ by lia.
++  destruct ZZ as [BELOW | ABOVE].
++  - assert (0 <= ofs < fn_stacksize f) as RANGE by lia.
++    apply (Mem.perm_free_2 _ _ _ _ _ FREE _ k p RANGE). assumption.
++  - unfold f_out_of_bounds in *.
++    pose proof (OUT_OF_BOUNDS ofs ABOVE) as OOB.
++    unfold loc_out_of_bounds in OOB. apply OOB.
++    pose proof (Mem.perm_free_3 _ _ _ _ _ FREE _ _ _ _ H).
++    apply Mem.perm_max with (k:=k).
++    apply Mem.perm_implies with (p1:=p). assumption.
++    constructor.
++Qed.
++
++Lemma entry_sequence0: forall f
++    (NEEDED: canary_needed f = true),
++    exists canary_op, getcanary = Some canary_op /\
++    (transf_function f).(fn_code) ! ((transf_function f).(fn_entrypoint)) = Some
++               (Iop canary_op nil (Pos.succ (max_reg_function f))
++                          ((max_pc_function f) + 2)%positive).
++Proof.
++  intros. unfold transf_function. rewrite NEEDED. cbn.
++  pose proof (canary_exists_if_needed f NEEDED) as CANARY.
++  destruct getcanary as [canary_op | ] eqn:CANARY_OP. 2: contradiction.
++  clear CANARY.
++  exists canary_op. split. reflexivity.
++  rewrite apply_checks_remain.
++  - rewrite crash_sequence_remain.
++    + Local Transparent entry_sequence.
++      unfold entry_sequence. rewrite CANARY_OP.
++      rewrite code_append_remain. rewrite code_append_remain.
++      { rewrite code_append_set. repeat f_equal. lia. reflexivity. }
++      all: repeat rewrite code_append_incr; mylia.
++    + use_entry_sequence_incr. mylia.
++  - use_entry_sequence_incr. use_crash_sequence_incr. mylia.
++  - intros insn ABSURD. exfalso.
++    pose proof (max_pc_function_sound _ _ _ ABSURD). mylia.
++Qed.
++
++Local Transparent canary_needed.
++Local Opaque code_append entry_sequence.
++
++Lemma entry_sequence1: forall f
++    (NEEDED: canary_needed f = true),
++    (transf_function f).(fn_code) ! (max_pc_function f + 2)%positive = Some
++      (Istore canary_chunk (Ainstack (Ptrofs.repr (canary_offset f))) nil
++         (Pos.succ (max_reg_function f)) ((max_pc_function f) + 3)%positive).
++Proof.
++  intros. unfold transf_function. rewrite NEEDED. cbn.
++  pose proof (canary_exists_if_needed f NEEDED) as CANARY.
++  destruct getcanary as [canary_op | ] eqn:CANARY_OP. 2: contradiction.
++  clear CANARY.
++  Local Transparent entry_sequence.
++  unfold entry_sequence. rewrite CANARY_OP.
++  rewrite apply_checks_remain.
++  - rewrite crash_sequence_remain.
++    + rewrite code_append_remain.
++      { rewrite code_append_set. repeat f_equal. lia.
++        rewrite code_append_incr. cbn. lia. }
++      repeat rewrite code_append_incr. mylia.
++    + repeat rewrite code_append_incr. mylia.
++  - repeat rewrite code_append_incr.
++    use_crash_sequence_incr.
++    repeat rewrite code_append_incr in H. mylia.
++  - intros insn ABSURD. exfalso.
++    pose proof (max_pc_function_sound _ _ _ ABSURD). mylia.
++Qed.
++
++Local Transparent canary_needed.
++Local Opaque code_append entry_sequence clearcanary.
++
++Lemma entry_sequence2: forall f
++    (NEEDED: canary_needed f = true),
++    (transf_function f).(fn_code) ! (max_pc_function f + 3)%positive = Some
++               (Iop clearcanary nil (Pos.succ (max_reg_function f))
++                          (f.(fn_entrypoint))).
++Proof.
++  intros. unfold transf_function. rewrite NEEDED. cbn.
++  pose proof (canary_exists_if_needed f NEEDED) as CANARY.
++  destruct getcanary as [canary_op | ] eqn:CANARY_OP. 2: contradiction.
++  clear CANARY.
++  Local Transparent entry_sequence.
++  unfold entry_sequence. rewrite CANARY_OP.
++  rewrite apply_checks_remain.
++  - rewrite crash_sequence_remain.
++    { rewrite code_append_set. reflexivity.
++      repeat rewrite code_append_incr. cbn. lia. }
++    repeat rewrite code_append_incr. mylia.
++  - repeat rewrite code_append_incr.
++    use_crash_sequence_incr.
++    repeat rewrite code_append_incr in H. mylia.
++  - intros insn ABSURD. exfalso.
++    pose proof (max_pc_function_sound _ _ _ ABSURD). mylia.
++Qed.
++
++Lemma params_preserved: forall f,
++    (fn_params (transf_function f)) = fn_params f.
++Proof.
++  reflexivity.
++Qed.
++
++Lemma init_regs_lessdef: forall params args args' (LESSDEF : Val.lessdef_list args args') r,
++    Val.lessdef (init_regs args params) # r
++                (init_regs args' params) # r.
++Proof.
++  induction params; intros; cbn.
++  { constructor. }
++  destruct args as [ | hargs targs]; inv LESSDEF.
++  { constructor. }
++  destruct (peq a r).
++  { subst. repeat rewrite Regmap.gss.
++    assumption. }
++  repeat rewrite Regmap.gso by congruence.
++  apply IHparams. assumption.
++Qed.
++
++Lemma canary_encode_size :
++  (Z.of_nat (Datatypes.length (encode_val canary_chunk (canary_val tt)))) =
++                                       canary_size.
++Proof.
++  unfold canary_val, canary_chunk, canary_size. intros.
++  rewrite encode_val_length.
++  destruct Archi.canary64 ; reflexivity.
++Qed.
++
++Lemma init_regs_undef:
++  forall params args r,
++  (forall r', In r' params -> Plt r' r) ->
++  (init_regs args params) # r = Vundef.
++Proof.
++  induction params; intros. reflexivity.
++  destruct args. reflexivity. cbn.
++  destruct (peq a r).
++  { subst.
++    assert (Plt r r).
++    { apply H. left. reflexivity. }
++    mylia.
++  }
++  rewrite Regmap.gso by congruence.
++  apply IHparams.
++  intros r' IN.
++  apply H. right. assumption.
++Qed.
++
++Lemma match_stacks_create_frame: forall
++    s s' stk sp m m' m2 m2' m2'' sz extra ofs
++  (PLE: Ple sp stk)
++  (STACKS: match_stacks sp m m' s s')
++  (ALLOC: Mem.alloc m 0 sz = (m2, stk))
++  (ALLOC': Mem.alloc m' 0 (sz + extra) = (m2', stk))
++  (EXTENDS : Mem.extends m m')
++  (EXTENDS2 : Mem.extends m2 m2')
++  (STORE' : Mem.store canary_chunk m2' stk ofs (canary_val tt) =
++           Some m2''),
++    match_stacks sp m2 m2'' s s'.
++Proof.
++  induction s; intros; inv STACKS. { constructor. }
++  constructor; trivial.
++  - eapply canary_perm_store. 2: eassumption.
++    eapply canary_perm_alloc. 2: eassumption.
++    assumption.
++  - unfold f_out_of_bounds, loc_out_of_bounds in *. intros.
++    intro PERM2.
++    assert (sp0 <> stk) as NEQ by mylia.
++    pose proof (Mem.perm_alloc_4 _ _ _ _ _ ALLOC _ _ _ _ PERM2 NEQ) as PERM.
++    pose proof (OUT_OF_BOUNDS ofs0 BEYOND).
++    contradiction.
++  - unfold canary_present in *. intro TRUE.
++    pose proof (CANARY_PRESENT TRUE) as LOAD.
++    clear CANARY_PRESENT.
++    erewrite Mem.load_store_other. 2: eassumption.
++    2: left; mylia.
++    erewrite Mem.load_alloc_unchanged; try eassumption.
++    rewrite <- Mem.valid_block_extends; try eassumption.
++    pose proof (Mem.alloc_result _ _ _ _ _ ALLOC).
++    mylia.
++  - eapply IHs; try eassumption. mylia.
++Qed.
++
++Local Opaque canary_needed.
++
++Definition check_sequence_passthrough
++           stk' f sp pc rs rs' m' :=
++  exists pc' rs2',
++    star step tge (State stk' (transf_function f) sp pc rs' m') E0
++                  (State stk' (transf_function f) sp pc' rs2' m') /\
++    match_regs f rs rs2' /\
++    (transf_function f).(fn_code) ! pc' = f.(fn_code) ! pc.
++
++Lemma match_regs_above: forall f rs rs'
++  (REGS: match_regs f rs rs') r v (ABOVE: Plt (max_reg_function f) r),
++    (match_regs f rs (rs' # r <- v)).
++Proof.
++  intros. destruct REGS as (REGS1 & REGS2). constructor; intros.
++  - rewrite Regmap.gso by mylia. apply REGS1. assumption.
++  - apply REGS2. assumption.
++Qed.
++
++Local Opaque canary_cmp.
++Lemma has_check_sequence_exec:
++  forall stk stk' f sp pc rs rs' m m'
++         (insn : instruction)
++         (AT_PC: f.(fn_code) ! pc = Some insn)
++         (MATCH: match_states (State stk f sp pc rs m)
++                              (State stk' (transf_function f) sp pc rs' m')),
++    check_sequence_passthrough stk' f sp pc rs rs' m'.
++Proof.
++  intros.
++  pose proof (transf_code f pc insn AT_PC) as TRANSF.
++  pose proof (transf_code_chk f pc insn AT_PC) as TRANSF_CHK.
++  inv MATCH.
++  destruct (check_insn insn && canary_needed f) eqn:TRIG; cycle 1.
++  { pose proof (TRANSF eq_refl) as TRANSF'.
++    exists pc. exists rs'. split. apply star_refl.
++    split. assumption. congruence.
++  }
++  rewrite andb_true_iff in TRIG.
++  destruct TRIG as (CHECK_INSN & NEEDED).
++  destruct (TRANSF_CHK eq_refl) as (pc' & HAS_CHECK).
++  destruct HAS_CHECK.
++  unfold check_sequence_passthrough.
++  eexists. eexists. split. apply plus_star.
++  eapply plus_left' with (t1:=E0) (t2:=E0). 3: reflexivity.
++  { apply exec_Inop. eassumption. }
++  eapply plus_left' with (t1:=E0) (t2:=E0). 3: reflexivity.
++  { eapply exec_Iload with (v:=canary_val tt). eassumption.
++    { reflexivity. }
++    cbn. rewrite Ptrofs.add_zero_l.
++    rewrite Ptrofs.unsigned_repr by (apply no_huge_stacksize; assumption).
++    rewrite zle_true by (apply canary_load_bound; assumption).
++    exact (CANARY_PRESENT NEEDED).
++  }
++  eapply plus_left' with (t1:=E0) (t2:=E0). 3: reflexivity.
++  { eapply exec_Iop with (v:=canary_val tt). eassumption.
++    apply eval_getcanary. assumption. }
++  eapply plus_one.
++  { eapply exec_Icond. eassumption.
++    {
++      rewrite eval_negate_condition. cbn.
++      rewrite Regmap.gso by lia. rewrite Regmap.gss.
++      rewrite Regmap.gss.
++      rewrite cmp_canary_ok. reflexivity.
++    }
++    reflexivity.
++  }
++  split.
++  { apply match_regs_above. 2: mylia.
++    apply match_regs_above. 2: mylia.
++    assumption. }
++  assumption.
++Qed.
++
++Ltac TRANSF := apply transf_code; (eassumption || reflexivity).
++
++Lemma step_simulation:
++  forall s1 t s2 (STEP : step ge s1 t s2)
++  s1' (MS: match_states s1 s1'),
++  exists s2', plus step tge s1' t s2' /\ match_states s2 s2'.
++Proof.
++  intros. inv STEP; inv MS.
++
++  (* Inop *)
++  - eexists. split.
++    + apply plus_one. apply exec_Inop.
++      TRANSF.
++    + constructor; auto.
++      
++  (* Iop *)
++  - assert (ARGS_LESSDEF : Val.lessdef_list (rs ## args) (rs' ## args)).
++    { apply match_regs_args with (f := f). assumption.
++      intros r IN. eapply max_reg_function_use. eassumption. exact IN. }
++    destruct (eval_operation_lessdef _ _ _ ARGS_LESSDEF MEM H0) as
++      (v' & EVAL' & RES_LESSDEF).
++    eexists. split.
++    + apply plus_one.
++      apply exec_Iop with (op := op) (args := args).
++      TRANSF.
++      rewrite eval_operation_preserved with (ge1 := ge) by apply symbols_preserved.
++      exact EVAL'.
++    + constructor; trivial.
++      apply match_regs_assign; trivial.
++      eapply max_reg_function_def. eassumption. reflexivity.
++
++  (* Iload *)
++  - rename stk' into s'.
++    assert (ARGS_LESSDEF : Val.lessdef_list (rs ## args) (rs' ## args)).
++    { apply match_regs_args with (f := f). assumption.
++      intros r IN. eapply max_reg_function_use. eassumption. exact IN. }
++    destruct (eval_addressing_lessdef _ _ _ ARGS_LESSDEF H0) as
++      (a' & EVAL' & ADDR_LESSDEF).
++    destruct (Mem.loadv_extends _ _ _ _ _ _ MEM H1 ADDR_LESSDEF)
++      as (v' & LOAD' & LOAD_LESSDEF).
++    eexists. split.
++    * apply plus_one.
++      apply exec_Iload with (chunk:=chunk) (addr:=addr) (args:=args) (a:=a').
++      TRANSF.
++      -- rewrite eval_addressing_preserved with (ge1 := ge) by apply symbols_preserved.
++         eassumption.
++      -- eassumption.
++    * constructor; trivial.
++      apply match_regs_assign; trivial.
++      eapply max_reg_function_def. eassumption. reflexivity.
++
++  (* Istore *)
++  - rename H0 into ADDR.
++    rename H1 into STORE.
++    rename m' into m2.
++    rename m'0 into m'.
++    assert (ARGS_LESSDEF : Val.lessdef_list (rs ## args) (rs' ## args)).
++    { apply match_regs_args with (f := f). assumption.
++      intros r IN. eapply max_reg_function_use. eassumption.
++      cbn. right. assumption. }
++    destruct (eval_addressing_lessdef _ _ _ ARGS_LESSDEF ADDR) as
++      (a' & ADDR' & ADDR_LESSDEF).
++    assert (SRC_LESSDEF : Val.lessdef rs # src rs' # src).
++    { apply REGS.
++      eapply max_reg_function_use. eassumption.
++      left. reflexivity. }
++    destruct (Mem.storev_extends _ _ _ _ _ _ _ _ MEM STORE ADDR_LESSDEF SRC_LESSDEF) as (m2' & STORE' & EXTENDS').
++    eexists. split.
++    + apply plus_one.
++      apply exec_Istore with (chunk:=chunk) (addr:=addr) (args:=args) (src:=src) (a:=a').
++      TRANSF.
++      rewrite eval_addressing_preserved with (ge1 := ge) by apply symbols_preserved.
++      assumption. eassumption.
++    + constructor; trivial.
++      * eapply mem_storev_valid_block_1; eassumption.
++      * eapply canary_perm_storev; eassumption.
++      * eapply f_out_of_bounds_storev; eassumption.
++      * eapply canary_present_storev. exact MEM. exact ADDR_LESSDEF.
++        all: eassumption.
++      * eapply match_stacks_storev. exact MEM. exact ADDR_LESSDEF.
++        all: eassumption.
++        
++  (* Icall *)
++  - assert (ARGS_LESSDEF : Val.lessdef_list (rs ## args) (rs' ## args)).
++    { apply match_regs_args with (f := f). assumption.
++      intros r IN. eapply max_reg_function_use. eassumption.
++      cbn. destruct ros ; [right ; assumption | assumption]. }
++    eexists. split.
++    + apply plus_one.
++      apply exec_Icall with (sig:=(funsig fd)) (ros:=ros).
++      3: apply sig_preserved.
++      TRANSF.
++      destruct ros; cbn in *.
++      * apply functions_translated.
++        assert (REG_OK : (r <= max_reg_function f)%positive).
++        { eapply max_reg_function_use. eassumption. cbn.
++          left. reflexivity. }
++        destruct (Genv.find_funct_inv _ _ H0) as (b & PTR).
++        destruct REGS as (REGS1 & REGS2).
++        pose proof (REGS1 r REG_OK) as LESSDEF.
++        rewrite PTR in LESSDEF. rewrite PTR in H0.
++        inv LESSDEF. assumption.
++      * rewrite symbols_preserved.
++        destruct (Genv.find_symbol ge i). 2: discriminate.
++        apply function_ptr_translated. exact H0.
++    + apply match_callstates; trivial.
++      constructor; trivial.
++      eapply max_reg_function_def. eassumption. reflexivity.
++        
++  (* Itailcall *)
++  - rename m' into m2. rename m'0 into m'. rename stk' into s'.
++    rename H2 into FREE.
++    destruct (free_with_canary _ _ _ _ _ FREE MEM OUT_OF_BOUNDS CANARY_PERM) as (m2' & FREE' & EXTENDS2).
++    assert (match_states (State s f (Vptr stk Ptrofs.zero) pc rs m)
++                         (State s' (transf_function f) (Vptr stk Ptrofs.zero) pc rs' m')) as MS.
++    { constructor; assumption. }
++    destruct (has_check_sequence_exec s s' f _ pc rs rs' m m' _ H MS) as (pc' & rs2' & STAR & REGS' & CODE).
++    assert (ARGS_LESSDEF : Val.lessdef_list (rs ## args) (rs2' ## args)).
++    { apply match_regs_args with (f := f). assumption.
++      intros r IN. eapply max_reg_function_use. eassumption.
++      cbn. destruct ros ; [right ; assumption | assumption]. }
++    eexists. split.
++    + eapply plus_right with (t1:=E0) (t2:=E0). 3: reflexivity.
++      exact STAR.
++      apply exec_Itailcall with (sig:=(funsig fd)) (ros:=ros) (args:=args).
++      3: apply sig_preserved.
++      * congruence.
++      * destruct ros; cbn in *.
++        -- apply functions_translated.
++           assert (REG_OK : (r <= max_reg_function f)%positive).
++           { eapply max_reg_function_use. eassumption. cbn.
++             left. reflexivity. }
++           destruct (Genv.find_funct_inv _ _ H0) as (b & PTR).
++           destruct REGS' as (REGS1 & REGS2).
++           pose proof (REGS1 r REG_OK) as LESSDEF.
++           rewrite PTR in LESSDEF. rewrite PTR in H0.
++           inv LESSDEF. assumption.
++        -- rewrite symbols_preserved.
++           destruct (Genv.find_symbol ge i). 2: discriminate.
++           apply function_ptr_translated. exact H0.
++      * eassumption.
++    + constructor; trivial.
++      apply match_stacks_advance with (bound := stk).
++      { erewrite Mem.nextblock_free by eassumption.
++        unfold Mem.valid_block, Ple, Plt in *. lia. }
++      eapply match_stacks_free; try eassumption.
++      apply Ple_refl.
++        
++  (* Ibuiltin *)
++  - rename m' into m2. rename m'0 into m'.
++    rename H0 into ARGS. rename H1 into CALL.
++    assert (forall r, Val.lessdef rs#r rs'#r) as LESSDEF_REGS.
++    { destruct REGS as (REGS1 & REGS2). intro r.
++      assert (r <= max_reg_function f \/ max_reg_function f < r)%positive as ZZ by lia.
++      destruct ZZ as [BELOW | ABOVE].
++      - apply REGS1. trivial.
++      - rewrite REGS2 by trivial. constructor. }
++    destruct (eval_builtin_args_lessdef _ LESSDEF_REGS MEM ARGS)
++             as (vargs' & ARGS' & LESSDEF_ARGS).
++    destruct (external_call_mem_extends ef _ _ _ _ CALL MEM LESSDEF_ARGS) as
++      (vres' & m2' & CALL' & LESSDEF_RES & EXTENDS2 & UNCHANGED).
++    eexists. split.
++    + apply plus_one.
++      apply exec_Ibuiltin with (ef:=ef) (args:=args) (vargs:=vargs').
++      * TRANSF.
++      * apply eval_builtin_args_preserved with (ge1:=ge).
++        -- apply symbols_preserved.
++        -- assumption.
++      * apply external_call_symbols_preserved with (ge1:=ge).
++        { apply senv_preserved. }
++        eassumption.
++    + constructor; trivial.
++      * pose proof (external_call_nextblock _ _ _ _ _ _ _ CALL).
++        unfold Mem.valid_block, Ple, Plt in *. lia.
++      * destruct UNCHANGED.
++        unfold canary_perm in *.
++        intros ofs RANGE.
++        apply unchanged_on_perm.
++        -- apply OUT_OF_BOUNDS. lia.
++        -- erewrite <- Mem.valid_block_extends; eassumption.
++        -- apply CANARY_PERM ; assumption.
++      * unfold f_out_of_bounds in *.
++        intros ofs RANGE.
++        unfold loc_out_of_bounds in *.
++        intro PERM2. apply (OUT_OF_BOUNDS ofs RANGE).
++        eapply external_call_max_perm. exact CALL.
++        assumption. assumption.
++      * eapply canary_present_external_call; try eassumption.
++        erewrite <- Mem.valid_block_extends; eassumption.
++      * (* regmap_setres *)
++        split; intros.
++        -- apply set_res_lessdef. assumption.
++           exact LESSDEF_REGS.
++        -- pose proof (max_reg_function_def f pc _ r H) as REMAIN.
++           destruct REGS as (REGS1 & REGS2).
++           destruct res; cbn in *.
++           { destruct (peq x r).
++              - subst. unfold Ple in *.
++                pose proof (REMAIN (eq_refl (Some r))). lia.
++              - rewrite Regmap.gso by congruence.
++                apply REGS2; assumption.
++           }
++           all: apply REGS2; assumption.
++
++      * eapply match_stacks_external_call with (m1:=m) (m1':=m'); eassumption.
++        
++  (* Icond *)
++  - rename H0 into COND.
++    assert (ARGS_LESSDEF : Val.lessdef_list (rs ## args) (rs' ## args)).
++    { apply match_regs_args with (f := f). assumption.
++      intros r IN. eapply max_reg_function_use. eassumption.
++      cbn. assumption. }
++    exists (State stk' (transf_function f) (Vptr sp0 Ptrofs.zero) (if b then ifso else ifnot) rs' m'). split.
++    + apply plus_one.
++      apply exec_Icond with (cond:=cond) (args:=args) (ifso:=ifso) (ifnot:=ifnot) (b:=b).
++      TRANSF.
++      apply (eval_condition_lessdef _ ARGS_LESSDEF MEM COND).
++      reflexivity.
++    + constructor; trivial.
++      
++  (* Ijumptable *) 
++  - eexists. split.
++    + apply plus_one.
++      apply exec_Ijumptable with (arg:=arg) (tbl:=tbl) (n:=n).
++      TRANSF.
++      assert (arg <= max_reg_function f)%positive as REG_OK.
++      { eapply max_reg_function_use. eassumption. constructor. reflexivity. }
++      destruct REGS as (REGS1 & REGS2).
++      pose proof (REGS1 arg REG_OK) as LESSDEF.
++      rewrite H0 in LESSDEF.
++      inv LESSDEF. reflexivity.
++      eassumption.
++    + constructor; trivial.
++
++  (* Ireturn *)
++  - rename m' into m2. rename m'0 into m'. rename stk' into s'.
++    rename H0 into FREE.
++    destruct (free_with_canary _ _ _ _ _ FREE MEM OUT_OF_BOUNDS CANARY_PERM) as (m2' & FREE' & EXTENDS2).
++    assert (match_states (State s f (Vptr stk Ptrofs.zero) pc rs m)
++                         (State s' (transf_function f) (Vptr stk Ptrofs.zero) pc rs' m')) as MS.
++    { constructor; assumption. }
++    destruct (has_check_sequence_exec s s' f _ pc rs rs' m m' _ H MS) as (pc' & rs2' & STAR & REGS' & CODE).
++    eexists. split.
++    + eapply plus_right with (t1:=E0) (t2:=E0). 3: reflexivity.
++      exact STAR.
++      apply exec_Ireturn with (or := or).
++      congruence.
++      eassumption.
++    + constructor; trivial.
++      * apply match_stacks_advance with (bound := stk).
++        { erewrite Mem.nextblock_free by eassumption.
++          unfold Mem.valid_block, Ple, Plt in *. lia. }
++        eapply match_stacks_free; try eassumption.
++        apply Ple_refl.
++      * destruct or; cbn. 2: constructor.
++        destruct REGS' as (REGS1 & REGS2).
++        apply (REGS1 r).
++        eapply max_reg_function_use. eassumption. constructor. reflexivity.
++        
++  (* internal call *)
++  - rename m' into m2. rename m'0 into m'. rename stk' into s'.
++    rename H into ARGTYPES. rename H0 into ALLOC.
++    assert (LO : 0 <= 0) by lia.
++    assert (HI: fn_stacksize f <= fn_stacksize (transf_function f)).
++    { cbn. pose proof (extra_canary_size_nonneg f). lia. }
++    destruct (Mem.alloc_extends _ _ _ _ _ _ _ _ MEM ALLOC LO HI) as (m2' & ALLOC' & EXTENDS').
++    destruct (canary_needed f) eqn:NEEDED.
++    + destruct (entry_sequence0 _ NEEDED) as (canary_op & CANARY_OP & OP0).
++      assert (Mem.range_perm m2' stk (canary_offset f)
++        (canary_offset f +
++            Z.of_nat (Datatypes.length (encode_val canary_chunk (canary_val tt))))
++         Cur Writable) as RANGE_PERM.
++      { rewrite canary_encode_size.
++        intros ofs RANGE.
++        unfold transf_function in ALLOC'.
++        cbn in ALLOC'.
++        apply Mem.perm_implies with (p1 := Freeable). 2: constructor.
++        eapply Mem.perm_alloc_2. eassumption.
++        unfold extra_canary_size. rewrite NEEDED.
++        unfold canary_offset in RANGE.
++        pose proof (no_negative_stacksize _ NEEDED).
++        pose proof (f_padding_nonneg f).
++        lia.
++      }
++      destruct (Mem.range_perm_storebytes m2' stk (canary_offset f) (encode_val canary_chunk (canary_val tt)) RANGE_PERM) as (m2'' & STOREBYTES).
++      assert (STORE' : Mem.store canary_chunk m2' stk (canary_offset f) (canary_val tt) = Some m2'').
++      { apply Mem.storebytes_store. assumption.
++        apply canary_offset_correct.
++      }
++      destruct (eval_clearcanary _ _ tge (Vptr stk Ptrofs.zero) m2'') as (v' & CLEAR).
++      eexists. split.
++      * eapply plus_left with (t1:=E0) (t2:=E0). 3: reflexivity.
++        { constructor. eauto using Val.has_argtype_list_lessdef. eassumption. }
++        eapply star_left with (t1:=E0) (t2:=E0). 3: reflexivity.
++        { eapply exec_Iop.
++          exact OP0.
++          apply eval_getcanary. assumption.
++        }
++        eapply star_left with (t1:=E0) (t2:=E0). 3: reflexivity.
++        { eapply exec_Istore.
++          { apply entry_sequence1. assumption. }
++          reflexivity. cbn.
++          rewrite Ptrofs.add_zero_l.
++          rewrite Ptrofs.unsigned_repr by (apply no_huge_stacksize; assumption).
++          rewrite Regmap.gss.
++          destruct zle as [_ | NOT]. exact STORE'.
++          exfalso. pose proof (canary_load_bound f NEEDED) as B. cbn in B. lia.
++        }
++        eapply star_one.
++        eapply exec_Iop.
++        { apply entry_sequence2. assumption. } cbn.
++        exact CLEAR.
++      * constructor.
++        -- eapply Mem.valid_new_block. exact ALLOC.
++        -- eapply canary_perm_store. 2: exact STORE'.
++           intros ofs RANGE.
++           cbn in ALLOC'.
++           eapply Mem.perm_alloc_2. exact ALLOC'.
++           assert (fn_stacksize f < 0 \/ fn_stacksize f >= 0) as ZZ by lia.
++           destruct ZZ.
++           { rewrite extra_canary_size_0_if_incorrect_size in RANGE by assumption.
++             lia. }
++           lia.
++        -- intros ofs RANGE. unfold loc_out_of_bounds.
++           intro PERM.
++           pose proof (Mem.perm_alloc_3 _ _ _ _ _ ALLOC _ _ _ PERM).
++           lia.
++        -- unfold canary_present. intro TRUE.
++           erewrite Mem.load_store_same. 2: exact STORE'.
++           f_equal; apply load_canary_ok.
++        -- unfold match_regs. split.
++           ++ intros.
++              repeat rewrite Regmap.gso by lia.
++              rewrite params_preserved.
++              apply init_regs_lessdef; assumption.
++           ++ intros. apply init_regs_undef. intros r' IN.
++              pose proof (max_reg_function_params f r' IN).
++              mylia.
++        -- eapply Mem.store_outside_extends. exact EXTENDS'.
++           exact STORE'.
++           intros ofs PERM RANGE.
++           pose proof (Mem.perm_alloc_3 _ _ _ _ _ ALLOC _ _ _ PERM).
++           unfold canary_offset in RANGE.
++           pose proof (f_padding_nonneg f).
++           lia.
++        -- eapply match_stacks_create_frame.
++           apply Ple_refl.
++           { rewrite (Mem.alloc_result _ _ _ _ _ ALLOC).
++             exact STACKS.
++           }
++           exact ALLOC.
++           exact ALLOC'.
++           exact MEM.
++           exact EXTENDS'.
++           exact STORE'.
++    + eexists. split.
++      * apply plus_one. apply exec_function_internal.
++        eauto using Val.has_argtype_list_lessdef. eassumption.
++      * assert (fn_entrypoint (transf_function f) = fn_entrypoint f) as ENTRYPOINT.
++        { unfold transf_function. rewrite NEEDED. reflexivity. }
++        rewrite ENTRYPOINT.
++        apply match_regular_states; trivial.
++        -- eapply Mem.valid_new_block; eassumption.
++        -- unfold canary_perm. intros ofs RANGE.
++           eapply Mem.perm_alloc_2. exact ALLOC'.
++           cbn.
++           assert (f.(fn_stacksize) < 0 \/ f.(fn_stacksize) >= 0) as ZZ by lia.
++           destruct ZZ.
++           { rewrite extra_canary_size_0_if_incorrect_size in RANGE by assumption.
++             lia. }
++           lia.
++        -- unfold f_out_of_bounds. intros ofs RANGE.
++           unfold loc_out_of_bounds. intro PERM.
++           pose proof (Mem.perm_alloc_3 _ _ _ _ _ ALLOC _ _ _ PERM).
++           lia.
++        -- unfold canary_present. intro TRUE. congruence.
++        -- apply match_regs_params. assumption.
++           apply Forall_forall. intros.
++           apply max_reg_function_params. assumption.
++        -- assert (stk = Mem.nextblock m).
++           { eapply Mem.alloc_result; eassumption. }
++           subst stk.
++           eapply match_stacks_alloc. 2,3,4: eassumption.
++           apply Ple_refl.
++    
++  (* external call *)
++  - rename m' into m2. rename m'0 into m'. rename s into stk.
++    destruct (external_call_mem_extends _ _ _ _ _ H MEM ARGS) as (v' & m2' & CALL' & LESSDEF2 & EXTENDS2 & UNCHANGED).
++    eexists. split.
++    + apply plus_one. apply exec_function_external.
++      apply external_call_symbols_preserved with (ge1:=ge).
++      apply senv_preserved.
++      exact CALL'.
++    + constructor; trivial.
++      destruct stk; inv STACKS.
++      { constructor. }
++      pose proof (external_call_nextblock _ _ _ _ _ _ _ H) as NEXTBLOCK.
++      constructor; trivial.
++      * unfold Ple, Plt in *. lia.
++      * eapply canary_perm_external_call. eassumption.
++        erewrite <- Mem.valid_block_extends by eassumption.
++        exact VALID_SP.
++        all: eassumption.
++      * eapply f_out_of_bounds_external_call; eassumption.
++      * eapply canary_present_external_call. eassumption.
++        erewrite <- Mem.valid_block_extends by eassumption.
++        exact VALID_SP.
++        all: eassumption.
++      * eapply match_stacks_external_call with (m1:=m) (m1':=m'); eassumption.
++
++  (* return *)
++  - inv STACKS. eexists. split.
++    + apply plus_one. constructor.
++    + constructor; trivial.
++      apply match_regs_assign; trivial.
++Qed.
++
++Lemma transf_initial_states:
++  forall st1, initial_state prog st1 -> exists st2, initial_state tprog st2 /\ match_states st1 st2.
++Proof.
++  intros. inv H. econstructor; split.
++  - econstructor.
++    + eapply (Genv.init_mem_transf TRANSL); eauto.
++    + rewrite symbols_preserved. rewrite (match_program_main TRANSL). eauto.
++    + eapply function_ptr_translated; eauto.
++    + rewrite <- H3; apply sig_preserved.
++  - constructor.
++    + apply Mem.extends_refl.
++    + constructor.
++    + constructor.
++Qed.
++  
++Lemma transf_final_states:
++  forall st1 st2 r
++         (MATCH : match_states st1 st2)
++         (FINAL : final_state st1 r),
++    final_state st2 r.
++Proof.
++  intros. inv FINAL. inv MATCH. inv STACKS. inv RES.
++  constructor.
++Qed.
++
++Theorem transf_program_correct:
++  forward_simulation (RTL.semantics prog) (RTL.semantics tprog).
++Proof.
++  eapply forward_simulation_plus.
++  apply senv_preserved.
++  eexact transf_initial_states.
++  eexact transf_final_states.
++  exact step_simulation.
++Qed.
++
++End PRESERVATION.
+diff --git a/backend/ValueDomain.v b/backend/ValueDomain.v
+index 73d9b3ac..8207a21b 100644
+--- a/backend/ValueDomain.v
++++ b/backend/ValueDomain.v
+@@ -4784,6 +4784,16 @@ Proof.
+ - auto.
+ Qed.
+ 
++(** Stack-protector canary: an unknown number. *)
++
++Definition canary_aval := Num Pbot.
++
++Lemma canary_aval_sound : vmatch (canary_val tt) canary_aval.
++Proof.
++  unfold canary_val, canary_aval.
++  destruct Archi.canary64; constructor.
++Qed.
++
+ End MATCH.
+ 
+ (** * Nonaliasing tests. *)
+diff --git a/common/Values.v b/common/Values.v
+index f25c2317..c944d64b 100644
+--- a/common/Values.v
++++ b/common/Values.v
+@@ -2745,3 +2745,25 @@ Proof.
+   unfold compose_meminj; rewrite H1; rewrite H3; eauto.
+   rewrite Ptrofs.add_assoc. decEq. unfold Ptrofs.add. apply Ptrofs.eqm_samerepr. auto with ints.
+ Qed.
++
++(** * Stack-protector canary *)
++
++(** The canary is a value chosen at program start-up (by the C library)
++  and unknown at compile time; it is modelled as an arbitrary constant. *)
++Parameter canary32_val: unit -> int.
++Parameter canary64_val: unit -> int64.
++Definition canary_val (_ : unit) :=
++  if Archi.canary64 then Vlong (canary64_val tt) else Vint (canary32_val tt).
++Definition canary_type := if Archi.canary64 then Tlong else Tint.
++
++Lemma canary_has_type: Val.has_type (canary_val tt) canary_type.
++Proof.
++  unfold canary_val, canary_type.
++  destruct Archi.canary64; constructor.
++Qed.
++
++Lemma canary_inject : forall F, Val.inject F (canary_val tt) (canary_val tt).
++Proof.
++  intro. unfold canary_val.
++  destruct Archi.canary64; constructor.
++Qed.
+diff --git a/driver/Clflags.ml b/driver/Clflags.ml
+index d3795386..f0add14f 100644
+--- a/driver/Clflags.ml
++++ b/driver/Clflags.ml
+@@ -36,6 +36,9 @@ let option_falignbranchtargets = ref 0
+ let option_faligncondbranchs = ref 0
+ let option_finline_asm = ref false
+ let option_fcommon = ref false
++(* Stack canaries (-fstack-protector, -fstack-protector-all) *)
++let option_stack_protector = ref false
++let option_stack_protector_all = ref false
+ let option_mthumb = ref (Configuration.model = "armv7m")
+ let option_midiv = ref false
+ let option_Osize = ref false
+diff --git a/driver/Compiler.v b/driver/Compiler.v
+index 60fc74fe..a33f4252 100644
+--- a/driver/Compiler.v
++++ b/driver/Compiler.v
+@@ -41,6 +41,7 @@ Require Renumber.
+ Require Constprop.
+ Require CSE.
+ Require Deadcode.
++Require Canary.
+ Require Unusedglob.
+ Require Allocation.
+ Require Tunneling.
+@@ -62,6 +63,7 @@ Require Renumberproof.
+ Require Constpropproof.
+ Require CSEproof.
+ Require Deadcodeproof.
++Require Canaryproof.
+ Require Unusedglobproof.
+ Require Allocproof.
+ Require Tunnelingproof.
+@@ -133,6 +135,7 @@ Definition transf_rtl_program (f: RTL.program) : res Asm.program :=
+   @@@ partial_if Compopts.optim_CSE (time "CSE" CSE.transf_program)
+    @@ print (print_RTL 6)
+   @@@ partial_if Compopts.optim_redundancy (time "Redundancy elimination" Deadcode.transf_program)
++   @@ total_if Compopts.stack_protector (time "Stack protector" Canary.transf_program)
+    @@ print (print_RTL 7)
+   @@@ time "Unused globals" Unusedglob.transform_program
+    @@ print (print_RTL 8)
+@@ -242,6 +245,7 @@ Definition CompCert's_passes :=
+   ::: mkpass (match_if Compopts.optim_constprop Renumberproof.match_prog)
+   ::: mkpass (match_if Compopts.optim_CSE CSEproof.match_prog)
+   ::: mkpass (match_if Compopts.optim_redundancy Deadcodeproof.match_prog)
++  ::: mkpass (match_if Compopts.stack_protector Canaryproof.match_prog)
+   ::: mkpass Unusedglobproof.match_prog
+   ::: mkpass Allocproof.match_prog
+   ::: mkpass Tunnelingproof.match_prog
+@@ -285,7 +289,8 @@ Proof.
+   set (p11 := total_if optim_constprop Renumber.transf_program p10) in *.
+   destruct (partial_if optim_CSE CSE.transf_program p11) as [p12|e] eqn:P12; simpl in T; try discriminate.
+   destruct (partial_if optim_redundancy Deadcode.transf_program p12) as [p13|e] eqn:P13; simpl in T; try discriminate.
+-  destruct (Unusedglob.transform_program p13) as [p14|e] eqn:P14; simpl in T; try discriminate.
++  set (p13c := total_if stack_protector Canary.transf_program p13) in *.
++  destruct (Unusedglob.transform_program p13c) as [p14|e] eqn:P14; simpl in T; try discriminate.
+   destruct (Allocation.transf_program p14) as [p15|e] eqn:P15; simpl in T; try discriminate.
+   set (p16 := Tunneling.tunnel_program p15) in *.
+   destruct (Linearize.transf_program p16) as [p17|e] eqn:P17; simpl in T; try discriminate.
+@@ -306,6 +311,7 @@ Proof.
+   exists p11; split. apply total_if_match. apply Renumberproof.transf_program_match.
+   exists p12; split. eapply partial_if_match; eauto. apply CSEproof.transf_program_match.
+   exists p13; split. eapply partial_if_match; eauto. apply Deadcodeproof.transf_program_match.
++  exists p13c; split. apply total_if_match. apply Canaryproof.transf_program_match.
+   exists p14; split. apply Unusedglobproof.transf_program_match; auto.
+   exists p15; split. apply Allocproof.transf_program_match; auto.
+   exists p16; split. apply Tunnelingproof.transf_program_match.
+@@ -364,7 +370,7 @@ Ltac DestructM :=
+       destruct H as (p & M & MM)
+   end.
+   repeat DestructM. subst tp.
+-  assert (F: forward_simulation (Cstrategy.semantics p) (Asm.semantics p21)).
++  assert (F: forward_simulation (Cstrategy.semantics p) (Asm.semantics p22)).
+   {
+   eapply compose_forward_simulations.
+     eapply SimplExprproof.transl_program_correct; eassumption.
+@@ -391,6 +397,8 @@ Ltac DestructM :=
+     eapply match_if_simulation. eassumption. exact CSEproof.transf_program_correct.
+   eapply compose_forward_simulations.
+     eapply match_if_simulation. eassumption. exact Deadcodeproof.transf_program_correct; eassumption.
++  eapply compose_forward_simulations.
++    eapply match_if_simulation. eassumption. exact Canaryproof.transf_program_correct.
+   eapply compose_forward_simulations.
+     eapply Unusedglobproof.transf_program_correct; eassumption.
+   eapply compose_forward_simulations.
+diff --git a/driver/Compopts.v b/driver/Compopts.v
+index 2a213350..839b13b6 100644
+--- a/driver/Compopts.v
++++ b/driver/Compopts.v
+@@ -44,3 +44,10 @@ Parameter thumb: unit -> bool.
+ 
+ (** Flag -g.  For insertion of debugging information. *)
+ Parameter debug: unit -> bool.
++
++(** Flag -fstack-protector.  For the insertion of stack canaries. *)
++Parameter stack_protector: unit -> bool.
++
++(** Flag -fstack-protector-all.  Protect all functions, not only those
++  with stack-allocated variables. *)
++Parameter stack_protector_all: unit -> bool.
+diff --git a/driver/Driver.ml b/driver/Driver.ml
+index 4f4588d0..9ee2eb8c 100644
+--- a/driver/Driver.ml
++++ b/driver/Driver.ml
+@@ -166,6 +166,23 @@ let toolchain_help =
+ |} end else
+     ""
+ 
++let stack_protector_help =
++  if Configuration.arch = "x86" || Configuration.arch = "aarch64" then
++{|Hardening options:
++  -fstack-protector  Check a stack canary before returning from functions
++                 that have stack-allocated variables [off]
++  -fstack-protector-strong  Same as -fstack-protector
++  -fstack-protector-all  Check a stack canary in all functions [off]
++  -fno-stack-protector  Turn off stack canaries
++|} else ""
++
++let set_stack_protector all () =
++  if Configuration.arch = "x86" || Configuration.arch = "aarch64" then begin
++    option_stack_protector := true;
++    if all then option_stack_protector_all := true
++  end else
++    warning no_loc Unnamed "option -fstack-protector not supported on this platform, ignored"
++
+ let usage_string =
+   version_string tool_name ^
+   {|Usage: ccomp [options] <source files>
+@@ -213,6 +230,7 @@ Code generation options: (use -fno-<opt> to turn off -f<opt>)
+   -falign-cond-branches <n>  Set alignment (in bytes) of conditional branches
+   -fcommon       Put uninitialized globals in the common section [off].
+ |} ^
++ stack_protector_help ^
+  target_help ^
+  toolchain_help ^
+  assembler_help ^
+@@ -326,6 +344,11 @@ let cmdline_actions =
+   Exact "-fno-pie", Unset option_fpie;
+   Exact "-fno-PIE", Unset option_fpie ] @
+       f_opt "common" option_fcommon @
++  [ Exact "-fstack-protector", Unit (set_stack_protector false);
++    Exact "-fstack-protector-strong", Unit (set_stack_protector false);
++    Exact "-fstack-protector-all", Unit (set_stack_protector true);
++    Exact "-fno-stack-protector", Unit (fun () ->
++        option_stack_protector := false; option_stack_protector_all := false) ] @
+ (* Target processor options *)
+   (if Configuration.arch = "arm" then
+     if Configuration.model = "armv6" then
+diff --git a/extraction/extraction.v b/extraction/extraction.v
+index a7c52967..5fe69b8e 100644
+--- a/extraction/extraction.v
++++ b/extraction/extraction.v
+@@ -102,9 +102,17 @@ Extract Constant Compopts.optim_redundancy =>
+   "fun _ -> !Clflags.option_fredundancy".
+ Extract Constant Compopts.thumb =>
+   "fun _ -> !Clflags.option_mthumb".
++Extract Constant Compopts.stack_protector =>
++  "fun _ -> !Clflags.option_stack_protector".
++Extract Constant Compopts.stack_protector_all =>
++  "fun _ -> !Clflags.option_stack_protector_all".
+ Extract Constant Compopts.debug =>
+   "fun _ -> !Clflags.option_g".
+ 
++(* Values: the canary value is only used in proofs. *)
++Extract Constant Values.canary32_val => "fun _ -> assert false".
++Extract Constant Values.canary64_val => "fun _ -> assert false".
++
+ (* Compiler *)
+ Extract Constant Compiler.print_Clight => "PrintClight.print_if".
+ Extract Constant Compiler.print_Cminor => "PrintCminor.print_if".
+diff --git a/powerpc/Archi.v b/powerpc/Archi.v
+index 5bb4cfe7..eaa580bd 100644
+--- a/powerpc/Archi.v
++++ b/powerpc/Archi.v
+@@ -36,6 +36,9 @@ Parameter single_passed_as_single : bool.
+ 
+ Definition splitlong := negb ppc64.
+ 
++(** Whether the stack-protector canary is a 64-bit value. *)
++Definition canary64 := false.
++
+ Lemma splitlong_ptr32: splitlong = true -> ptr64 = false.
+ Proof.
+   reflexivity.
+diff --git a/powerpc/Op.v b/powerpc/Op.v
+index a0e4f181..70b95c35 100644
+--- a/powerpc/Op.v
++++ b/powerpc/Op.v
+@@ -1350,3 +1350,8 @@ Definition builtin_arg_ok
+   | (BA _ | BA_splitlong (BA _) (BA _)) => true
+   | _ => builtin_arg_ok_1 ba c
+   end.  
++
++(** Stack protector: not implemented on this target. *)
++Definition getcanary : option operation := None.
++Definition clearcanary := if Archi.canary64 then Olongconst Int64.zero else Ointconst Int.zero.
++Definition canary_cmp := if Archi.canary64 then Ccomplu Ceq else Ccompu Ceq.
+diff --git a/riscV/Archi.v b/riscV/Archi.v
+index 52802f9c..b686012d 100644
+--- a/riscV/Archi.v
++++ b/riscV/Archi.v
+@@ -29,6 +29,9 @@ Definition align_float64 := 8%Z.
+ 
+ Definition splitlong := negb ptr64.
+ 
++(** Whether the stack-protector canary is a 64-bit value. *)
++Definition canary64 := ptr64.
++
+ Lemma splitlong_ptr32: splitlong = true -> ptr64 = false.
+ Proof.
+   unfold splitlong. destruct ptr64; simpl; congruence. 
+diff --git a/riscV/Op.v b/riscV/Op.v
+index fdaba86c..6781d785 100644
+--- a/riscV/Op.v
++++ b/riscV/Op.v
+@@ -1374,3 +1374,8 @@ Definition builtin_arg_ok
+   | (BA _ | BA_splitlong (BA _) (BA _)) => true
+   | _ => builtin_arg_ok_1 ba c
+   end.  
++
++(** Stack protector: not implemented on this target. *)
++Definition getcanary : option operation := None.
++Definition clearcanary := if Archi.canary64 then Olongconst Int64.zero else Ointconst Int.zero.
++Definition canary_cmp := if Archi.canary64 then Ccomplu Ceq else Ccompu Ceq.
+diff --git a/x86/Asm.v b/x86/Asm.v
+index 14999445..819395df 100644
+--- a/x86/Asm.v
++++ b/x86/Asm.v
+@@ -251,7 +251,9 @@ Inductive instruction: Type :=
+   | Pallocframe(sz: Z)(ofs_ra ofs_link: ptrofs)
+   | Pfreeframe(sz: Z)(ofs_ra ofs_link: ptrofs)
+   | Pbuiltin(ef: external_function)(args: list (builtin_arg preg))(res: builtin_res preg)
++  | Pgetcanary (rd: ireg)               (**r load the stack-protector canary *)
+   (** Instructions not generated by [Asmgen] -- TO CHECK *)
++  | Pstack_chk_fail                     (**r call [__stack_chk_fail] *)
+   | Padcl_ri (rd: ireg) (n: int)
+   | Padcl_rr (rd: ireg) (r2: ireg)
+   | Paddl_mi (a: addrmode) (n: int)
+@@ -976,6 +978,8 @@ Definition exec_instr (f: function) (i: instruction) (rs: regset) (m: mem) : out
+       end
+   | Pbuiltin ef args res =>
+       Stuck                             (**r treated specially below *)
++  | Pgetcanary rd =>
++      Next (nextinstr (rs#rd <- (canary_val tt))) m
+   (** The following instructions and directives are not generated
+       directly by [Asmgen], so we do not model them. *)
+   | Padcl_ri _ _
+@@ -1015,7 +1019,8 @@ Definition exec_instr (f: function) (i: instruction) (rs: regset) (m: mem) : out
+   | Psbbl_rr _ _
+   | Psqrtsd _ _
+   | Psubl_ri _ _
+-  | Psubq_ri _ _ => Stuck
++  | Psubq_ri _ _
++  | Pstack_chk_fail => Stuck
+   end.
+ 
+ (** Translation of the LTL/Linear/Mach view of machine registers
+diff --git a/x86/Asmexpand.ml b/x86/Asmexpand.ml
+index b189b69b..5f0a6638 100644
+--- a/x86/Asmexpand.ml
++++ b/x86/Asmexpand.ml
+@@ -493,6 +493,9 @@ let expand_builtin_inline name args res =
+   (* Optimization hint *)
+   | "__builtin_unreachable", [], _ ->
+      ()
++  (* Stack protector: canary mismatch *)
++  | "__stack_chk_fail", [], _ ->
++     emit Pstack_chk_fail
+   (* Catch-all *)
+   | _ ->
+      raise (Error ("unrecognized builtin " ^ name))
+diff --git a/x86/Asmgen.v b/x86/Asmgen.v
+index 59f94df9..e98efd0d 100644
+--- a/x86/Asmgen.v
++++ b/x86/Asmgen.v
+@@ -636,6 +636,8 @@ Definition transl_op
+       assertion (mreg_eq a1 res);
+       do r <- ireg_of res; do r2 <- ireg_of a2;
+       transl_sel c args r r2 k
++  | Ogetcanary, nil =>
++      do r <- ireg_of res; OK (Pgetcanary r :: k)
+   | _, _ =>
+       Error(msg "Asmgen.transl_op")
+   end.
+diff --git a/x86/Machregs.v b/x86/Machregs.v
+index 2b6fc8ab..9ebc4097 100644
+--- a/x86/Machregs.v
++++ b/x86/Machregs.v
+@@ -350,6 +350,7 @@ Definition two_address_op (op: operation) : bool :=
+   | Osingleoflong => false
+   | Ocmp c => false
+   | Osel c op => true
++  | Ogetcanary => false
+   end.
+ 
+ (* Constraints on constant propagation for builtins *)
+diff --git a/x86/NeedOp.v b/x86/NeedOp.v
+index fddc46e5..43d54b7a 100644
+--- a/x86/NeedOp.v
++++ b/x86/NeedOp.v
+@@ -107,6 +107,7 @@ Definition needs_of_operation (op: operation) (nv: nval): list nval :=
+   | Olongoffloat | Ofloatoflong | Olongofsingle | Osingleoflong => op1 (default nv)
+   | Ocmp c => needs_of_condition c
+   | Osel c ty => nv :: nv :: needs_of_condition c
++  | Ogetcanary => nil
+   end.
+ 
+ Definition operation_is_redundant (op: operation) (nv: nval): bool :=
+diff --git a/x86/Op.v b/x86/Op.v
+index 3c139f1a..148d2aeb 100644
+--- a/x86/Op.v
++++ b/x86/Op.v
+@@ -170,7 +170,9 @@ Inductive operation : Type :=
+   | Osingleoflong            (**r [rd = float32_of_signed_long(r1)] *)
+ (*c Boolean tests: *)
+   | Ocmp (cond: condition)  (**r [rd = 1] if condition holds, [rd = 0] otherwise. *)
+-  | Osel: condition -> typ -> operation.
++  | Osel: condition -> typ -> operation
++  | Ogetcanary                   (**r [rd = stack-protector canary] *)
++  .
+                              (**r [rd = rs1] if condition holds, [rd = rs2] otherwise. *)
+ 
+ (** Comparison functions (used in modules [CSE] and [Allocation]). *)
+@@ -440,6 +442,7 @@ Definition eval_operation
+   | Osingleoflong, v1::nil => Val.singleoflong v1
+   | Ocmp c, _ => Some(Val.of_optbool (eval_condition c vl m))
+   | Osel c ty, v1::v2::vl => Some(Val.select (eval_condition c vl m) v1 v2 ty)
++  | Ogetcanary, nil => Some (canary_val tt)
+   | _, _ => None
+   end.
+ 
+@@ -614,6 +617,7 @@ Definition type_of_operation (op: operation) : list typ * typ :=
+   | Osingleoflong => (Tlong :: nil, Tsingle)
+   | Ocmp c => (type_of_condition c, Tint)
+   | Osel c ty => (ty :: ty :: type_of_condition c, ty)
++  | Ogetcanary => (nil, canary_type)
+   end.
+ 
+ (** Weak type soundness results for [eval_operation]:
+@@ -774,6 +778,7 @@ Proof with (try exact I; try reflexivity).
+   destruct v0; simpl in H0; inv H0...
+   destruct (eval_condition cond vl m); simpl... destruct b...
+   unfold Val.select. destruct (eval_condition c vl m). apply Val.normalize_type. exact I.
++  apply canary_has_type.
+ Qed.
+ 
+ End SOUNDNESS.
+@@ -1353,6 +1358,7 @@ Proof.
+   apply Val.select_inject; auto.  
+   destruct (eval_condition c vl1 m1) eqn:?; auto.
+   right; symmetry; eapply eval_condition_inj; eauto.
++  apply canary_inject.
+ Qed.
+ 
+ End EVAL_COMPAT.
+@@ -1545,3 +1551,9 @@ Definition builtin_arg_ok
+   | (BA _ | BA_splitlong (BA _) (BA _)) => true
+   | _ => builtin_arg_ok_1 ba c
+   end.  
++
++(** Stack protector: how to read the canary, how to compare it, and how to
++  clear the register that held it. *)
++Definition getcanary : option operation := Some Ogetcanary.
++Definition clearcanary := if Archi.canary64 then Olongconst Int64.zero else Ointconst Int.zero.
++Definition canary_cmp := if Archi.canary64 then Ccomplu Ceq else Ccompu Ceq.
+diff --git a/x86/PrintOp.ml b/x86/PrintOp.ml
+index ac2e8f49..559bb1ce 100644
+--- a/x86/PrintOp.ml
++++ b/x86/PrintOp.ml
+@@ -170,6 +170,7 @@ let print_operation reg pp = function
+       fprintf pp "%a ?%s %a : %a"
+          (print_condition reg) (c, args)
+          (PrintAST.name_of_type ty) reg r1 reg r2
++  | Ogetcanary, [] -> fprintf pp "getcanary"
+   | _ -> fprintf pp "<bad operator>"
+ 
+ 
+diff --git a/x86/TargetPrinter.ml b/x86/TargetPrinter.ml
+index b5eb3de8..b5ae98af 100644
+--- a/x86/TargetPrinter.ml
++++ b/x86/TargetPrinter.ml
+@@ -863,6 +863,15 @@ module Target(System: SYSTEM):TARGET =
+       | Pallocframe(sz, ofs_ra, ofs_link)
+       | Pfreeframe(sz, ofs_ra, ofs_link) ->
+ 	 assert false
++      | Pgetcanary rd ->
++          (* glibc keeps the canary in the thread control block *)
++          if Configuration.system <> "linux" then
++            failwith "-fstack-protector is only supported on Linux";
++          if Archi.ptr64
++          then fprintf oc "	movq	%%fs:40, %a\n" ireg64 rd
++          else fprintf oc "	movl	%%gs:20, %a\n" ireg32 rd
++      | Pstack_chk_fail ->
++          fprintf oc "	call	%a\n" raw_symbol "__stack_chk_fail@PLT"
+       | Pbuiltin(ef, args, res) ->
+           begin match ef with
+             | EF_annot(kind,txt, targs) ->
+diff --git a/x86/ValueAOp.v b/x86/ValueAOp.v
+index 4d346f90..a87d4a9a 100644
+--- a/x86/ValueAOp.v
++++ b/x86/ValueAOp.v
+@@ -163,6 +163,7 @@ Definition eval_static_operation (op: operation) (vl: list aval): aval :=
+   | Osingleoflong, v1::nil => singleoflong v1
+   | Ocmp c, _ => of_optbool (eval_static_condition c vl)
+   | Osel c ty, v1::v2::vl => select (eval_static_condition c vl) v1 v2 ty
++  | Ogetcanary, nil => canary_aval
+   | _, _ => Vbot
+   end.
+ 
+@@ -264,6 +265,7 @@ Proof.
+   apply binop_float_sound; auto.
+   apply of_optbool_sound. eapply eval_static_condition_sound; eauto.
+   apply select_sound; auto. eapply eval_static_condition_sound; eauto.
++  apply canary_aval_sound.
+ Qed.
+ 
+ End SOUNDNESS.
+diff --git a/x86_32/Archi.v b/x86_32/Archi.v
+index 14c97e2b..d6427015 100644
+--- a/x86_32/Archi.v
++++ b/x86_32/Archi.v
+@@ -29,6 +29,9 @@ Definition align_float64 := 4%Z.
+ 
+ Definition splitlong := negb ptr64.
+ 
++(** Whether the stack-protector canary is a 64-bit value. *)
++Definition canary64 := false.
++
+ Lemma splitlong_ptr32: splitlong = true -> ptr64 = false.
+ Proof.
+   unfold splitlong. destruct ptr64; simpl; congruence.
+diff --git a/x86_64/Archi.v b/x86_64/Archi.v
+index 50cb1691..b4e7b4a8 100644
+--- a/x86_64/Archi.v
++++ b/x86_64/Archi.v
+@@ -29,6 +29,9 @@ Definition align_float64 := 8%Z.
+ 
+ Definition splitlong := negb ptr64.
+ 
++(** Whether the stack-protector canary is a 64-bit value. *)
++Definition canary64 := true.
++
+ Lemma splitlong_ptr32: splitlong = true -> ptr64 = false.
+ Proof.
+   unfold splitlong. destruct ptr64; simpl; congruence.

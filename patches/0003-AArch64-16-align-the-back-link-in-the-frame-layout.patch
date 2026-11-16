@@ -1,0 +1,95 @@
+From db599e27c22fb7918b4b13451243885f0533e00e Mon Sep 17 00:00:00 2001
+From: Justin Restivo <justin@restivo.me>
+Date: Mon, 16 Nov 2026 17:22:49 -0500
+Subject: [PATCH 3/3] AArch64: 16-align the back link in the frame layout
+
+The frame layout aligned the back-link offset to 8 only, so the upper
+part of the frame, fe_size - fe_ofs_link, could be 8 mod 16.  For frames
+whose upper part exceeds 512 bytes, the prologue expansion lowers SP by
+that amount and then stores the back link and return address through SP.
+Linux enables SP alignment checking, so that store raised SIGBUS.  Seen
+in SQLite (sqlite3RunParser) inside Signal's SQLCipher Node addon on
+aarch64-linux; present in 3.18.
+
+Fix it in the verified frame layout rather than in the (unverified)
+expansion: align the back link to 16, and state the property the
+expansion relies on as lemma frame_env_link_aligned.  The frame grows by
+at most 16 bytes.
+---
+ aarch64/Stacklayout.v | 31 ++++++++++++++++++++++++-------
+ 1 file changed, 24 insertions(+), 7 deletions(-)
+
+diff --git a/aarch64/Stacklayout.v b/aarch64/Stacklayout.v
+index cdbc64d5..5ef6235a 100644
+--- a/aarch64/Stacklayout.v
++++ b/aarch64/Stacklayout.v
+@@ -27,13 +27,14 @@ Local Open Scope sep_scope.
+ - Local stack slots.
+ - Space for the stack-allocated data declared in Cminor.
+ 
+-The stack pointer is kept 16-aligned.
++The stack pointer is kept 16-aligned, and so is the back link
++(see [frame_env_link_aligned]).
+ *)
+ 
+ Definition fe_ofs_arg := 0.
+ 
+ Definition make_env (b: bounds) : frame_env :=
+-  let olink := align (4 * b.(bound_outgoing)) 8 in  (* back link *)
++  let olink := align (4 * b.(bound_outgoing)) 16 in (* back link *)
+   let oretaddr := olink + 8 in                      (* return address *)
+   let ocs := oretaddr + 8 in                        (* callee-saves *)
+   let ol :=  align (size_callee_save_area b ocs) 8 in (* locals *)
+@@ -60,7 +61,7 @@ Lemma frame_env_separated:
+ Proof.
+ Local Opaque Z.add Z.mul sepconj range.
+   intros; simpl.
+-  set (olink := align (4 * b.(bound_outgoing)) 8).
++  set (olink := align (4 * b.(bound_outgoing)) 16).
+   set (oretaddr := olink + 8).
+   set (ocs := oretaddr + 8).
+   set (ol :=  align (size_callee_save_area b ocs) 8).
+@@ -100,7 +101,7 @@ Lemma frame_env_range:
+   0 <= fe_stack_data fe /\ fe_stack_data fe + bound_stack_data b <= fe_size fe.
+ Proof.
+   intros; simpl.
+-  set (olink := align (4 * b.(bound_outgoing)) 8).
++  set (olink := align (4 * b.(bound_outgoing)) 16).
+   set (oretaddr := olink + 8).
+   set (ocs := oretaddr + 8).
+   set (ol :=  align (size_callee_save_area b ocs) 8).
+@@ -126,15 +127,31 @@ Lemma frame_env_aligned:
+   /\ (align_chunk Mptr | fe_ofs_retaddr fe).
+ Proof.
+   intros; simpl.
+-  set (olink := align (4 * b.(bound_outgoing)) 8).
++  set (olink := align (4 * b.(bound_outgoing)) 16).
+   set (oretaddr := olink + 8).
+   set (ocs := oretaddr + 8).
+   set (ol :=  align (size_callee_save_area b ocs) 8).
+   set (ostkdata := align (ol + 4 * b.(bound_local)) 8).
+   change (align_chunk Mptr) with 8.
+   split. apply Z.divide_0_r.
++  assert (L: (8 | olink)).
++  { apply Z.divide_trans with 16. exists 2; auto. apply align_divides; lia. }
+   split. apply align_divides; lia.
+   split. apply align_divides; lia.
+-  split. apply align_divides; lia.
+-  apply Z.divide_add_r. apply align_divides; lia. apply Z.divide_refl.
++  split. exact L.
++  apply Z.divide_add_r. exact L. apply Z.divide_refl.
++Qed.
++
++(** The back link sits at a multiple of 16 below a frame size that is itself
++  a multiple of 16.  The prologue expansion in [Asmexpand] relies on this:
++  it lowers SP by [fe_size - fe_ofs_link] before storing the back link and
++  return address through SP, and Linux faults (SIGBUS) on accesses through
++  a stack pointer that is not 16-aligned. *)
++
++Lemma frame_env_link_aligned:
++  forall b,
++  let fe := make_env b in
++  (16 | fe_size fe) /\ (16 | fe_ofs_link fe).
++Proof.
++  intros; simpl. split; apply align_divides; lia.
+ Qed.

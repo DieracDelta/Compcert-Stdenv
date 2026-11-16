@@ -1,0 +1,48 @@
+From c8ae0518e2894d2dc65455657bd64ee00bb18460 Mon Sep 17 00:00:00 2001
+From: Justin Restivo <justin@restivo.me>
+Date: Mon, 16 Nov 2026 14:17:10 -0500
+Subject: [PATCH 2/3] configure: 128-bit integer types in Linux headers on
+ AArch64 and RISC-V
+
+As on x86-64, undefine __SIZEOF_INT128__ when preprocessing: Linux's
+<linux/types.h> otherwise declares __s128/__u128 with __int128, which
+CompCert cannot parse.  Seen building dnsmasq on aarch64-linux.
+
+On AArch64 that is not enough: <asm/sigcontext.h>, pulled in by
+<signal.h> under _DEFAULT_SOURCE or _GNU_SOURCE, uses __u128 (and
+<sys/user.h> __uint128_t) unconditionally, so even
+"#define _GNU_SOURCE / #include <signal.h>" failed to compile.  Define
+those types as a 16-byte structure aligned to 16, which gives the
+declarations the same layout as with gcc (checked against gcc for
+struct fpsimd_context: size 528, vregs at offset 16, alignment 16).
+---
+ configure | 9 +++++++--
+ 1 file changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/configure b/configure
+index 09a69aa3..e6e1b701 100755
+--- a/configure
++++ b/configure
+@@ -417,7 +417,7 @@ if test "$arch" = "riscV"; then
+   casm_options="$model_options -c"
+   clinker_options="$model_options"
+   clinker_needs_no_pie=false
+-  cprepro_options="$model_options -U__GNUC__ -E"
++  cprepro_options="$model_options -U__GNUC__ -U__SIZEOF_INT128__ -E"
+   system="linux"
+   pic_supported=true
+ fi
+@@ -429,7 +429,12 @@ if test "$arch" = "aarch64"; then
+   case "$target" in
+     linux)
+         abi="standard"
+-        cprepro_options="-U__GNUC__ -E"
++        # Linux's <asm/sigcontext.h>, pulled in by <signal.h> under
++        # _DEFAULT_SOURCE/_GNU_SOURCE, uses 128-bit integer types even when
++        # __SIZEOF_INT128__ is undefined.  Stand in a 16-byte, 16-aligned
++        # structure, which gives those declarations gcc's layout.
++        u128="struct { _Alignas(16) unsigned long long __lo; unsigned long long __hi; }"
++        cprepro_options="-U__GNUC__ -U__SIZEOF_INT128__ '-D__u128=$u128' '-D__uint128_t=$u128' '-D__int128_t=$u128' -E"
+         system="linux"
+         pic_supported=true
+         ;;
